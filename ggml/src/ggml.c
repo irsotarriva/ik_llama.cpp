@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-moe-la.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -10912,6 +10913,40 @@ struct ggml_tensor * ggml_top_k_thresh(
                    result->nb[1], result->nb[2], result->nb[3],
                 0);
 
+    return result;
+}
+
+// ggml_moe_la_topk
+
+bool ggml_moe_la_active(void) {
+    return ggml_moe_la_enabled();
+}
+
+bool ggml_moe_la_real_active(void) {
+    return ggml_moe_la_real();
+}
+
+bool ggml_moe_la_take_tensor(int layer, struct ggml_tensor * tensor, const char * path, uint64_t file_offset) {
+    return ggml_moe_la_register(layer, tensor, path, file_offset);
+}
+
+void ggml_moe_la_start(void) {
+    ggml_moe_la_prefill();
+}
+
+struct ggml_tensor * ggml_moe_la_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        int                   layer) {
+    GGML_ASSERT(a->ne[0] >= k);
+    struct ggml_tensor * result = ggml_argsort_thresh(ctx, a, 1, 0.0f);
+    ggml_set_op_params_i32(result, 2, (int32_t) k);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result = ggml_view_4d(ctx, result,
+                k, result->ne[1], result->ne[2], result->ne[3],
+                   result->nb[1], result->nb[2], result->nb[3],
+                0);
     return result;
 }
 
@@ -23244,6 +23279,19 @@ static void ggml_compute_forward_argsort_thresh_f32(
 
     int min_entries = ggml_get_op_params_i32(dst, 0);
     float thresh    = ggml_get_op_params_f32(dst, 1);
+    const int la_k = ggml_get_op_params_i32(dst, 2);
+    if (la_k > 0) {
+        // stateful (it tracks residency), so one thread walks the tokens in order
+        if (ith != 0) return;
+        const int la_layer = ggml_get_op_params_i32(dst, 3);
+        ggml_moe_la_begin(la_layer);
+        for (int64_t i = 0; i < nr; ++i) {
+            ggml_moe_la_select(la_layer, (const float *)((char *) src0->data + i*nb01), (int) ne0, la_k,
+                               (int32_t *)((char *) dst->data + i*nb1));
+        }
+        ggml_moe_la_end(la_layer);
+        return;
+    }
 
     //if (ith == 0) printf("%s: min_entries = %d, thresh = %g\n", __func__, min_entries, (double)thresh);
 
