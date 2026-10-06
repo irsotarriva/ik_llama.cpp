@@ -164,6 +164,7 @@ struct la_state {
     uint64_t events = 0, served = 0, reads = 0, exact_reads = 0, substituted = 0, dropped = 0, evicted = 0;
     std::atomic<uint64_t> read_bytes{0};
     double read_wait_s = 0, prefill_s = 0;
+    int    peak_over = 0;      // most experts held beyond the budget at one time
     uint64_t prefill_bytes = 0;
 
     la_state() {
@@ -224,6 +225,7 @@ struct la_state {
                             "prefill %.2f GiB in %.2f s\n",
                     read_bytes.load()/gib, read_wait_s, read_wait_s > 0 ? read_bytes.load()/gib/read_wait_s : 0.0,
                     (unsigned long long) evicted, prefill_bytes/gib, prefill_s);
+            fprintf(stderr, "moe-la: at most %d experts over the budget at one time\n", peak_over);
         }
         if (!stats_path.empty()) {
             if (FILE * f = fopen(stats_path.c_str(), "a")) {
@@ -340,6 +342,21 @@ struct la_state {
         }
     }
 
+    // evict least recently served experts until the layer is within its budget
+    void trim(la_layer & L) {
+        const int n_expert = (int) L.resident.size();
+        while (L.n_resident > L.cap) {
+            int victim = -1;
+            for (int x = 0; x < n_expert; ++x) {
+                if (L.resident[x] && (victim < 0 || L.last[x] < L.last[victim])) victim = x;
+            }
+            if (victim < 0) break;
+            L.resident[victim] = 0;
+            L.n_resident--;
+            if (real) release_expert(L, victim);
+        }
+    }
+
     void release_expert(la_layer & L, int e) {
         for (auto & t : L.tensors) {
             // keep the pages shared with the neighbouring experts
@@ -419,22 +436,22 @@ void ggml_moe_la_prefill(void) {
 void ggml_moe_la_begin(int layer) {
     la_state & s = state();
     std::lock_guard<std::mutex> lock(s.mtx);
+    // A run of many tokens (a prompt batch) may take a layer over its budget, because every
+    // expert the run uses has to be in memory at once. The kernels of the other layers have
+    // finished by now, so bring those back under budget here: the excess is then never more
+    // than what one layer needs for one batch.
+    int over = 0;
+    for (int l = 0; l < (int) s.layers.size(); ++l) {
+        if (!s.layers[l]) continue;
+        over += std::max(0, s.layers[l]->n_resident - s.layers[l]->cap);
+        if (l != layer) s.trim(*s.layers[l]);
+    }
+    s.peak_over = std::max(s.peak_over, over);
     if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
     la_layer & L = *s.layers[layer];
+    s.trim(L);
     L.run_start = L.clock + 1;
     L.pending.clear();
-    // a previous run of many tokens may have gone over the budget; come back under it
-    const int n_expert = (int) L.resident.size();
-    while (L.n_resident > L.cap) {
-        int victim = -1;
-        for (int x = 0; x < n_expert; ++x) {
-            if (L.resident[x] && (victim < 0 || L.last[x] < L.last[victim])) victim = x;
-        }
-        if (victim < 0) break;
-        L.resident[victim] = 0;
-        L.n_resident--;
-        if (s.real) s.release_expert(L, victim);
-    }
 }
 
 void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int32_t * ids) {
