@@ -35,6 +35,9 @@
 //                          occupy host memory
 //   LA_EXCESS_RAM=x        bias against an expert in host memory relative to one in VRAM,
 //                          on the scale where a non-resident expert is 1 (default 0)
+//   LA_EVICT=freq|lru      which resident expert makes room: the one the router asked for least
+//                          (decayed count, the default) or the least recently served
+//   LA_DECAY=d             factor applied to the request counts every 16 tokens (default 0.98)
 //   LA_IO_THREADS=n        reader threads in real mode (default 8)
 //   LA_STATS=path          append one JSON line of counters at exit
 

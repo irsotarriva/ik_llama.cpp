@@ -120,6 +120,7 @@ struct la_tensor {
 struct la_layer {
     std::vector<uint8_t>  resident;   // per expert
     std::vector<uint64_t> last;       // clock of the last time an expert was served
+    std::vector<float>    usage;      // decayed count of how often the router asked for an expert
     std::vector<la_tensor> tensors;   // real mode
     std::vector<int> pending;         // experts to read before this run of tokens ends
     std::vector<int16_t> gpu_slot;    // per expert: its VRAM slot, or -1
@@ -140,6 +141,8 @@ struct la_state {
     float  theta     = 0.0f;
     float  price_res = 0.1f;
     float  gpu_frac  = 0.0f;
+    bool   evict_freq = true;   // evict the least requested expert, not the least recently served
+    float  decay     = 0.98f;   // applied to the request counts every 16 tokens
     float  excess_ram = 0.0f;
     int    io_threads = 8;
     std::string profile_path;
@@ -178,6 +181,8 @@ struct la_state {
         if (const char * v = getenv("LA_PRICE_RESIDENT")) price_res = (float) atof(v);
         if (const char * v = getenv("LA_GPU_FRAC"))       gpu_frac  = (float) atof(v);
         if (const char * v = getenv("LA_EXCESS_RAM"))     excess_ram = (float) atof(v);
+        if (const char * v = getenv("LA_EVICT"))          evict_freq = strcmp(v, "lru") != 0;
+        if (const char * v = getenv("LA_DECAY"))          decay     = (float) atof(v);
         if (const char * v = getenv("LA_IO_THREADS"))     io_threads = std::max(1, atoi(v));
         if (const char * v = getenv("LA_PROFILE"))        profile_path = v;
         if (const char * v = getenv("LA_STATS"))          stats_path   = v;
@@ -248,6 +253,7 @@ struct la_state {
         la_layer * L = new la_layer;
         L->resident.assign(n_expert, 0);
         L->last.assign(n_expert, 0);
+        L->usage.assign(n_expert, 0.0f);
         L->gpu_slot.assign(n_expert, -1);
         return L;
     }
@@ -342,13 +348,19 @@ struct la_state {
         }
     }
 
-    // evict least recently served experts until the layer is within its budget
+    // true if a should be evicted before b
+    bool colder(const la_layer & L, int a, int b) const {
+        if (evict_freq && L.usage[a] != L.usage[b]) return L.usage[a] < L.usage[b];
+        return L.last[a] < L.last[b];
+    }
+
+    // evict the coldest experts until the layer is within its budget
     void trim(la_layer & L) {
         const int n_expert = (int) L.resident.size();
         while (L.n_resident > L.cap) {
             int victim = -1;
             for (int x = 0; x < n_expert; ++x) {
-                if (L.resident[x] && (victim < 0 || L.last[x] < L.last[victim])) victim = x;
+                if (L.resident[x] && (victim < 0 || colder(L, x, victim))) victim = x;
             }
             if (victim < 0) break;
             L.resident[victim] = 0;
@@ -515,6 +527,10 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     // recently served expert that this run of tokens does not use makes room
     if (L.run_start == 0) L.run_start = L.clock + 1;
     L.clock++;
+    for (int j = 0; j < kk; ++j) L.usage[wanted[j]] += 1.0f;
+    if (s.decay < 1.0f && (L.clock & 15) == 0) {
+        for (float & u : L.usage) u *= s.decay;
+    }
     for (int j = 0; j < n_served; ++j) L.last[ids[j]] = L.clock;
     for (int j = 0; j < n_served; ++j) {
         const int e = ids[j];
@@ -525,7 +541,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
             int victim = -1;
             for (int x = 0; x < n_expert; ++x) {
                 if (!L.resident[x] || L.last[x] >= L.run_start) continue;
-                if (victim < 0 || L.last[x] < L.last[victim]) victim = x;
+                if (victim < 0 || s.colder(L, x, victim)) victim = x;
             }
             if (victim >= 0) {
                 L.resident[victim] = 0;
