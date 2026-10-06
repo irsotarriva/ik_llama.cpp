@@ -5407,6 +5407,66 @@ static bool llm_load_tensors(
         llm_requantize_output_tensor(model, extra_output_type);
     }
 
+    if (ggml_moe_la_gpu_active() && !dry_run) {
+        // load-aware VRAM tier: copy the most used experts of each layer into GPU slot tensors
+        const int gpu_id = (model.main_gpu >= 0 && model.main_gpu < (int) model.devices.size())
+            ? model.devices[model.main_gpu] : std::max(0, (int) model.main_gpu);
+        ggml_backend_buffer_type_t slot_buft = llama_default_buffer_type_offload(model, gpu_id);
+        const int n_la_layers = (int) model.layers.size();
+        model.la_slots.assign(n_la_layers, { nullptr, nullptr, nullptr });
+        std::vector<std::vector<int32_t>> slot_experts(n_la_layers);
+        struct ggml_init_params ip = { ggml_tensor_overhead()*(size_t)(3*n_la_layers + 8), nullptr, true };
+        ggml_context * sctx = slot_buft ? ggml_init(ip) : nullptr;
+        size_t n_slots = 0;
+        for (int il = 0; sctx && il < n_la_layers; ++il) {
+            auto & layer = model.layers[il];
+            ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+            bool ok = true;
+            for (ggml_tensor * t : exps) {
+                ok = ok && t && t->data && !t->view_src && (!t->buffer || ggml_backend_buffer_is_host(t->buffer));
+            }
+            if (!ok) { ggml_moe_la_gpu_drop(il); continue; }
+            const int n_exp = (int) exps[0]->ne[2];
+            slot_experts[il].resize(n_exp);
+            const int n = ggml_moe_la_gpu_slots(il, n_exp, slot_experts[il].data(), n_exp);
+            slot_experts[il].resize(n);
+            if (n == 0) continue;
+            for (int j = 0; j < 3; ++j) {
+                // one extra slot of zero weights: a selected expert that runs on the CPU is pointed at it
+                ggml_tensor * s = ggml_new_tensor_3d(sctx, exps[j]->type, exps[j]->ne[0], exps[j]->ne[1], n + 1);
+                ggml_format_name(s, "blk.%d.la_slots.%d", il, j);
+                model.la_slots[il][j] = s;
+            }
+            n_slots += n;
+        }
+        ggml_backend_buffer_t sbuf = (sctx && n_slots > 0) ? ggml_backend_alloc_ctx_tensors_from_buft(sctx, slot_buft) : nullptr;
+        if (!sbuf) {
+            LLAMA_LOG_WARN("%s: load-aware VRAM tier: no GPU slots could be allocated, running without it\n", __func__);
+            for (int il = 0; il < n_la_layers; ++il) ggml_moe_la_gpu_drop(il);
+            model.la_slots.clear();
+            if (sctx) ggml_free(sctx);
+        } else {
+            model.ctxs.push_back(sctx);
+            model.bufs.push_back(sbuf);
+            for (int il = 0; il < n_la_layers; ++il) {
+                if (!model.la_slots[il][0]) continue;
+                auto & layer = model.layers[il];
+                ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+                for (int j = 0; j < 3; ++j) {
+                    const size_t stride = ggml_nbytes(exps[j]) / (size_t) exps[j]->ne[2];
+                    const std::vector<char> zeros(stride, 0);
+                    ggml_backend_tensor_set(model.la_slots[il][j], zeros.data(), slot_experts[il].size()*stride, stride);
+                    for (size_t slot = 0; slot < slot_experts[il].size(); ++slot) {
+                        ggml_backend_tensor_set(model.la_slots[il][j],
+                                (const char *) exps[j]->data + (size_t) slot_experts[il][slot]*stride, slot*stride, stride);
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: load-aware VRAM tier: %zu experts in GPU slots (%.1f MiB)\n", __func__, n_slots,
+                    ggml_backend_buffer_get_size(sbuf)/1024.0/1024.0);
+        }
+    }
+
     if (ggml_moe_la_real_active() && !dry_run) {
         // load-aware real mode: the selector takes over the memory of the routed experts
         int n_taken = 0;

@@ -1655,6 +1655,15 @@ llm_expert_gating_func_type   gating_op,
 
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
 
+    // load-aware VRAM tier: experts that have a GPU slot run there, the others on the CPU
+    ggml_tensor * sel_exec = selected_experts;
+    const std::array<ggml_tensor *, 3> * la_slots = nullptr;
+    if (ggml_moe_la_gpu_active() && n_expert_used < n_expert && !weight_before_ffn && type_op == LLM_FFN_SILU &&
+        il >= 0 && il < (int) lctx.model.la_slots.size() && lctx.model.la_slots[il][0]) {
+        la_slots = &lctx.model.la_slots[il];
+        sel_exec = ggml_moe_la_aux_op(ctx, selected_experts, 2, il);
+    }
+
     if (weight_before_ffn) {
         // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
         ggml_tensor * repeated = ggml_new_tensor_3d(ctx, cur->type, n_embd, n_expert_used, n_tokens);
@@ -1672,12 +1681,12 @@ llm_expert_gating_func_type   gating_op,
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps) {
         if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
-            par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
+            par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, sel_exec, up_gate_exps_b, nullptr,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                     type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
+            par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, sel_exec,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
@@ -1686,20 +1695,20 @@ llm_expert_gating_func_type   gating_op,
 
     if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
         if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
-            par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
+            par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, sel_exec, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                     type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
+            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, sel_exec,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
     } else {
-        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, sel_exec); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
-        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, sel_exec); // [n_ff, n_expert_used, n_tokens]
         cb(gate, "ffn_moe_gate", il);
 
         if (graph) {
@@ -1709,12 +1718,12 @@ llm_expert_gating_func_type   gating_op,
         }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx, up, up_exps_b, selected_experts);
+            up = ggml_add_id(ctx, up, up_exps_b, sel_exec);
             cb(up, "ffn_moe_up_biased", il);
         }
 
         if (gate_exps_b) {
-            gate = ggml_add_id(ctx, gate, gate_exps_b, selected_experts);
+            gate = ggml_add_id(ctx, gate, gate_exps_b, sel_exec);
             cb(gate, "ffn_moe_gate_biased", il);
         }
 
@@ -1734,8 +1743,21 @@ llm_expert_gating_func_type   gating_op,
     }
     cb(par, "ffn_moe_gate_par", il);
 
-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, sel_exec); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+
+    if (la_slots) {
+        ggml_tensor * ids_g  = ggml_moe_la_aux_op(ctx, selected_experts, 1, il);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx, (*la_slots)[0], cur, ids_g);
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx, (*la_slots)[1], cur, ids_g);
+        ggml_tensor * par_g  = ggml_fused_mul_unary(ctx, gate_g, up_g, GGML_UNARY_OP_SILU);
+        *((float *)(par_g->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+        ggml_tensor * exp_g  = ggml_mul_mat_id(ctx, (*la_slots)[2], par_g, ids_g);
+        cb(exp_g, "ffn_moe_down_gpu", il);
+        // entries that ran on the other side are exact zeros on each side
+        experts = ggml_add(ctx, experts, exp_g);
+        cb(experts, "ffn_moe_down_both", il);
+    }
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx, experts, down_exps_b, selected_experts);

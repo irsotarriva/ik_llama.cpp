@@ -30,6 +30,11 @@
 //                          most frequent experts start resident and popular layers
 //                          get more slots. Without it every layer gets the same
 //                          number of slots and starts empty.
+//   LA_GPU_FRAC=g          share of all routed experts kept in VRAM slots (needs LA_PROFILE
+//                          and a GPU backend); they are the most frequent ones and never
+//                          occupy host memory
+//   LA_EXCESS_RAM=x        bias against an expert in host memory relative to one in VRAM,
+//                          on the scale where a non-resident expert is 1 (default 0)
 //   LA_IO_THREADS=n        reader threads in real mode (default 8)
 //   LA_STATS=path          append one JSON line of counters at exit
 
@@ -61,6 +66,20 @@ void ggml_moe_la_begin(int layer);
 // At most k experts are selected, at least one.
 void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int32_t * ids);
 void ggml_moe_la_end(int layer);
+
+// VRAM tier. The engine keeps a copy of some experts of each layer in GPU slot
+// tensors and runs them there; the rest run on the CPU as usual.
+bool ggml_moe_la_gpu(void);
+// Which experts of `layer` get a slot: writes up to max_slots expert ids, returns the count.
+int  ggml_moe_la_gpu_plan(int layer, int n_expert, int32_t * experts, int max_slots);
+// The engine could not create the slots of `layer`: its experts go back to the CPU.
+void ggml_moe_la_gpu_cancel(int layer);
+// Split one token's selection (k entries, -1 = dropped) between the two sides.
+//   kind 1: int32 slot index of each entry that runs on the GPU; the others get the index one past
+//           the last slot, where the engine keeps an all-zero expert so they contribute nothing
+//   kind 2: int32 expert id of each entry that runs on the CPU, -1 for the others
+//   kind 3: float 1 for each entry that runs on the GPU, 0 for the others
+void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out);
 
 #ifdef __cplusplus
 }

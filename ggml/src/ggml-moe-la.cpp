@@ -122,6 +122,8 @@ struct la_layer {
     std::vector<uint64_t> last;       // clock of the last time an expert was served
     std::vector<la_tensor> tensors;   // real mode
     std::vector<int> pending;         // experts to read before this run of tokens ends
+    std::vector<int16_t> gpu_slot;    // per expert: its VRAM slot, or -1
+    int      n_gpu      = 0;
     int      n_resident = 0;
     int      cap        = 0;
     uint64_t clock      = 0;
@@ -137,6 +139,8 @@ struct la_state {
     float  beta      = 0.0f;
     float  theta     = 0.0f;
     float  price_res = 0.1f;
+    float  gpu_frac  = 0.0f;
+    float  excess_ram = 0.0f;
     int    io_threads = 8;
     std::string profile_path;
     std::string stats_path;
@@ -156,6 +160,7 @@ struct la_state {
     std::atomic<bool> io_failed{false};
 
     // counters, in expert-runs unless noted
+    uint64_t gpu_served = 0;
     uint64_t events = 0, served = 0, reads = 0, exact_reads = 0, substituted = 0, dropped = 0, evicted = 0;
     std::atomic<uint64_t> read_bytes{0};
     double read_wait_s = 0, prefill_s = 0;
@@ -170,6 +175,8 @@ struct la_state {
         if (const char * v = getenv("LA_BETA"))           beta      = (float) atof(v);
         if (const char * v = getenv("LA_THETA"))          theta     = (float) atof(v);
         if (const char * v = getenv("LA_PRICE_RESIDENT")) price_res = (float) atof(v);
+        if (const char * v = getenv("LA_GPU_FRAC"))       gpu_frac  = (float) atof(v);
+        if (const char * v = getenv("LA_EXCESS_RAM"))     excess_ram = (float) atof(v);
         if (const char * v = getenv("LA_IO_THREADS"))     io_threads = std::max(1, atoi(v));
         if (const char * v = getenv("LA_PROFILE"))        profile_path = v;
         if (const char * v = getenv("LA_STATS"))          stats_path   = v;
@@ -184,6 +191,11 @@ struct la_state {
             }
             if (profile.empty()) fprintf(stderr, "moe-la: cannot read profile %s, starting cold\n", profile_path.c_str());
         }
+        if (gpu_frac > 0 && profile.empty()) {
+            fprintf(stderr, "moe-la: LA_GPU_FRAC needs LA_PROFILE, VRAM tier off\n");
+            gpu_frac = 0;
+        }
+        if (gpu_frac > 0) fprintf(stderr, "moe-la: VRAM tier, gpu_frac=%g excess_ram=%g\n", (double) gpu_frac, (double) excess_ram);
         fprintf(stderr, "moe-la: enabled (%s), resident_frac=%g beta=%g theta=%g price_resident=%g profile=%s\n",
                 real ? "real" : "modelled", (double) frac, (double) beta, (double) theta, (double) price_res,
                 profile.empty() ? "(none)" : profile_path.c_str());
@@ -206,6 +218,7 @@ struct la_state {
         fprintf(stderr, "moe-la: events=%llu served/event=%.3f reads/event=%.3f exact_reads/event=%.3f "
                         "substituted/event=%.3f dropped/event=%.3f\n",
                 (unsigned long long) events, served/ev, reads/ev, exact_reads/ev, substituted/ev, dropped/ev);
+        if (gpu_frac > 0) fprintf(stderr, "moe-la: gpu_served/event=%.3f\n", gpu_served/ev);
         if (real) {
             fprintf(stderr, "moe-la: read %.2f GiB in %.2f s of waiting (%.2f GiB/s), %llu evictions; "
                             "prefill %.2f GiB in %.2f s\n",
@@ -233,6 +246,7 @@ struct la_state {
         la_layer * L = new la_layer;
         L->resident.assign(n_expert, 0);
         L->last.assign(n_expert, 0);
+        L->gpu_slot.assign(n_expert, -1);
         return L;
     }
 
@@ -243,10 +257,15 @@ struct la_state {
         std::vector<int> order(profile.size());
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return profile[a] > profile[b]; });
-        const size_t keep = (size_t) std::min<double>((double) order.size(), (double) frac * (double) order.size());
+        const size_t n_gpu = (size_t) std::min<double>((double) order.size(), (double) gpu_frac * (double) order.size());
+        const size_t keep = (size_t) std::min<double>((double) order.size(), (double) n_gpu + (double) frac * (double) order.size());
         layers.resize(n_layers);
         for (int l = 0; l < n_layers; ++l) layers[l].reset(fresh(n_expert));
-        for (size_t i = 0; i < keep; ++i) {
+        for (size_t i = 0; i < n_gpu; ++i) {
+            la_layer & L = *layers[order[i] / n_expert];
+            L.gpu_slot[order[i] % n_expert] = (int16_t) L.n_gpu++;
+        }
+        for (size_t i = n_gpu; i < keep; ++i) {
             la_layer & L = *layers[order[i] / n_expert];
             L.resident[order[i] % n_expert] = 1;
             L.n_resident++;
@@ -439,7 +458,10 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     if (s.beta > 0) {
         const float rng = std::max(probs[wanted[0]] - probs[wanted[kk - 1]], 1e-12f);
         adj.resize(n_expert);
-        for (int e = 0; e < n_expert; ++e) adj[e] = probs[e] - (L.resident[e] ? 0.0f : s.beta * rng);
+        for (int e = 0; e < n_expert; ++e) {
+            const float excess = L.gpu_slot[e] >= 0 ? 0.0f : L.resident[e] ? s.excess_ram : 1.0f;
+            adj[e] = probs[e] - s.beta * rng * excess;
+        }
         std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
                           [&](int a, int b) { return adj[a] > adj[b] || (adj[a] == adj[b] && a < b); });
         for (int j = 0; j < kk; ++j) picked[j] = idx[j];
@@ -453,7 +475,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     const float top = probs[picked[0]];
     for (int j = 0; j < kk; ++j) {
         const int e = picked[j];
-        const float price = L.resident[e] ? s.price_res : 1.0f;
+        const float price = (L.resident[e] || L.gpu_slot[e] >= 0) ? s.price_res : 1.0f;
         if (j > 0 && s.theta > 0 && probs[e] < s.theta * top * price) {
             s.dropped++;
             continue;
@@ -466,7 +488,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     s.events++;
     s.served += n_served;
     for (int j = 0; j < kk; ++j) {
-        if (!L.resident[wanted[j]]) s.exact_reads++;
+        if (!L.resident[wanted[j]] && L.gpu_slot[wanted[j]] < 0) s.exact_reads++;
         bool in_wanted = false;
         for (int i = 0; i < kk; ++i) in_wanted |= (wanted[i] == picked[j]);
         if (!in_wanted) s.substituted++;
@@ -479,6 +501,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     for (int j = 0; j < n_served; ++j) L.last[ids[j]] = L.clock;
     for (int j = 0; j < n_served; ++j) {
         const int e = ids[j];
+        if (L.gpu_slot[e] >= 0) { s.gpu_served++; continue; }
         if (L.resident[e]) continue;
         s.reads++;
         if (L.n_resident >= L.cap) {
@@ -513,4 +536,45 @@ void ggml_moe_la_end(int layer) {
     }
     L.pending.clear();
     L.run_start = L.clock + 1;
+}
+bool ggml_moe_la_gpu(void) { return state().enabled && state().gpu_frac > 0; }
+
+int ggml_moe_la_gpu_plan(int layer, int n_expert, int32_t * experts, int max_slots) {
+    la_state & s = state();
+    if (!s.enabled || s.gpu_frac <= 0) return 0;
+    std::lock_guard<std::mutex> lock(s.mtx);
+    la_layer & L = s.get(layer, n_expert);
+    int n = 0;
+    for (int e = 0; e < n_expert; ++e) {
+        const int slot = L.gpu_slot[e];
+        if (slot < 0) continue;
+        if (slot >= max_slots) { L.gpu_slot[e] = -1; continue; }
+        experts[slot] = e;
+        n = std::max(n, slot + 1);
+    }
+    return n;
+}
+
+// Called when the engine could not create the slots of a layer: its experts go back to the CPU.
+void ggml_moe_la_gpu_cancel(int layer) {
+    la_state & s = state();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
+    la_layer & L = *s.layers[layer];
+    std::fill(L.gpu_slot.begin(), L.gpu_slot.end(), (int16_t) -1);
+    L.n_gpu = 0;
+}
+
+void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out) {
+    la_state & s = state();
+    const la_layer * L = (int) s.layers.size() > layer ? s.layers[layer].get() : nullptr;
+    for (int j = 0; j < k; ++j) {
+        const int e = ids[j];
+        const int slot = (L && e >= 0 && e < (int) L->gpu_slot.size()) ? L->gpu_slot[e] : -1;
+        switch (kind) {
+            case 1: ((int32_t *) out)[j] = slot >= 0 ? slot : (L ? L->n_gpu : 0); break;   // else the all-zero slot
+            case 2: ((int32_t *) out)[j] = slot >= 0 ? -1 : e;   break;
+            default: ((float *) out)[j]  = slot >= 0 ? 1.0f : 0.0f; break;
+        }
+    }
 }

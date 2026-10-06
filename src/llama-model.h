@@ -636,6 +636,9 @@ struct llama_model {
     layer_buft buft_output;
     std::vector<layer_buft> buft_layer;
 
+    // load-aware VRAM tier: per layer, GPU copies of some experts (gate, up, down), or nulls
+    std::vector<std::array<struct ggml_tensor *, 3>> la_slots;
+
     // contexts where the model tensors metadata is stored
     std::vector<struct ggml_context *> ctxs;
 
