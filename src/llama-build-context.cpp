@@ -55,7 +55,7 @@ llm_build_context::llm_build_context(
         n_embd_head_v    (hparams.n_embd_head_v(0)),
         n_embd_v_gqa     (hparams.n_embd_v_gqa()),
         n_expert         (hparams.n_expert),
-        n_expert_used    (warmup ? hparams.n_expert : hparams.n_expert_used),
+        n_expert_used    (warmup && !ggml_moe_la_real_active() ? hparams.n_expert : hparams.n_expert_used),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),
@@ -1606,7 +1606,11 @@ llm_expert_gating_func_type   gating_op,
         } else {
             //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
             //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
-            selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            if (ggml_moe_la_active() && n_expert_used < n_expert) {
+                selected_experts = ggml_moe_la_topk(ctx, selection_probs, n_expert_used, il);
+            } else {
+                selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            }
         }
     }
     cb(selected_experts, "ffn_moe_topk", il);

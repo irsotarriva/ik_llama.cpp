@@ -5407,6 +5407,23 @@ static bool llm_load_tensors(
         llm_requantize_output_tensor(model, extra_output_type);
     }
 
+    if (ggml_moe_la_real_active() && !dry_run) {
+        // load-aware real mode: the selector takes over the memory of the routed experts
+        int n_taken = 0;
+        for (int il = 0; il < (int) model.layers.size(); ++il) {
+            auto & layer = model.layers[il];
+            ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+            for (ggml_tensor * t : exps) {
+                if (!t || !t->data || t->view_src) continue;
+                const auto * w = ml.get_weight(ggml_get_name(t));
+                if (!w) continue;
+                if (ggml_moe_la_take_tensor(il, t, ml.files.at(w->idx)->get_path().c_str(), w->offs)) ++n_taken;
+            }
+        }
+        LLAMA_LOG_INFO("%s: load-aware real mode took over %d routed-expert tensors\n", __func__, n_taken);
+        ggml_moe_la_start();
+    }
+
     if (use_mmap_buffer || keep_ple_mapping) {
         for (auto & mapping : ml.mappings) {
             model.mappings.emplace_back(std::move(mapping));
