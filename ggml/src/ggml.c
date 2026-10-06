@@ -10934,6 +10934,36 @@ void ggml_moe_la_start(void) {
     ggml_moe_la_prefill();
 }
 
+bool ggml_moe_la_gpu_active(void) {
+    return ggml_moe_la_gpu();
+}
+
+int ggml_moe_la_gpu_slots(int layer, int n_expert, int32_t * experts, int max_slots) {
+    return ggml_moe_la_gpu_plan(layer, n_expert, experts, max_slots);
+}
+
+void ggml_moe_la_gpu_drop(int layer) {
+    ggml_moe_la_gpu_cancel(layer);
+}
+
+struct ggml_tensor * ggml_moe_la_aux_op(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int                   kind,
+        int                   layer) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    struct ggml_tensor * result = kind == 3
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ids->ne[0], ids->ne[1])
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 2, (int32_t) -kind);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result->op     = GGML_OP_ARGSORT_THRESH;
+    result->grad   = NULL;
+    result->src[0] = ids;
+    return result;
+}
+
 struct ggml_tensor * ggml_moe_la_topk(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -23329,6 +23359,19 @@ static void ggml_compute_forward_argsort_thresh(
     struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
+
+    const int la_kind = -ggml_get_op_params_i32(dst, 2);
+    if (la_kind > 0) {
+        // load-aware: split a selection between the GPU slots and the CPU
+        if (params->ith != 0) return;
+        const int la_layer = ggml_get_op_params_i32(dst, 3);
+        const size_t row = la_kind == 3 ? dst->nb[2] : dst->nb[1];
+        for (int64_t i = 0; i < src0->ne[1]; ++i) {
+            ggml_moe_la_aux(la_layer, la_kind, (const int32_t *)((const char *) src0->data + i*src0->nb[1]),
+                            (int) src0->ne[0], (char *) dst->data + i*row);
+        }
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:

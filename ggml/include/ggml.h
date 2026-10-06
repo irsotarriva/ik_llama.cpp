@@ -2510,6 +2510,16 @@ extern "C" {
     GGML_API bool ggml_moe_la_real_active(void);
     GGML_API bool ggml_moe_la_take_tensor(int layer, struct ggml_tensor * tensor, const char * path, uint64_t file_offset);
     GGML_API void ggml_moe_la_start(void);
+    // VRAM tier (LA_GPU_FRAC): some experts of a layer live in GPU slot tensors
+    GGML_API bool ggml_moe_la_gpu_active(void);
+    GGML_API int  ggml_moe_la_gpu_slots(int layer, int n_expert, int32_t * experts, int max_slots);
+    GGML_API void ggml_moe_la_gpu_drop(int layer);
+    // kind 1: slot ids for the GPU side, 2: expert ids for the CPU side, 3: float mask of the GPU side
+    GGML_API struct ggml_tensor * ggml_moe_la_aux_op(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            int                   kind,
+            int                   layer);
     GGML_API struct ggml_tensor * ggml_moe_la_topk(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
