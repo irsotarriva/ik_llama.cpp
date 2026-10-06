@@ -23,6 +23,10 @@
 //   LA_RESIDENT_FRAC=f     share of all routed experts that fit in memory (default 1)
 //   LA_BETA=b              bias against non-resident experts, in units of the
 //                          probability range of the router top-k (default 0)
+//   LA_GAMMA=g             multiplicative bias: a non-resident expert competes with its
+//                          probability times exp(-g), so only experts of similar probability
+//                          replace each other (default 0)
+//   LA_PROTECT=m           the router's first m experts are always served (default 0)
 //   LA_THETA=t             drop a selected expert whose probability is below
 //                          t * top probability * price of its tier (default 0)
 //   LA_PRICE_RESIDENT=p    price of a resident expert relative to a read one (default 0.1)
@@ -35,6 +39,12 @@
 //                          occupy host memory
 //   LA_EXCESS_RAM=x        bias against an expert in host memory relative to one in VRAM,
 //                          on the scale where a non-resident expert is 1 (default 0)
+//   LA_ASYNC=1             an expert the router asked for but the selection replaced is read in
+//                          the background and becomes resident the next time its layer runs,
+//                          so the cache follows what the router wants without making tokens wait
+//   LA_ASYNC_QUEUE=n       real mode: most experts waiting for a background read (default 64)
+//   LA_ASYNC_THREADS=n     real mode: background reader threads (default 2)
+//   LA_ASYNC_RATE=x        modelled mode: background reads per layer per token (default 1.5)
 //   LA_EVICT=freq|lru      which resident expert makes room: the one the router asked for least
 //                          (decayed count, the default) or the least recently served
 //   LA_DECAY=d             factor applied to the request counts every 16 tokens (default 0.98)
