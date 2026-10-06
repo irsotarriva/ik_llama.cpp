@@ -146,6 +146,7 @@ struct la_state {
     float  frac      = 1.0f;
     float  beta      = 0.0f;
     float  gamma     = 0.0f;    // multiplicative bias: a non-resident expert competes with p * exp(-gamma)
+    int    prefetch  = 0;       // experts per token read ahead for the next layer
     int    protect   = 0;       // the router's first `protect` experts are always served
     float  theta     = 0.0f;
     float  price_res = 0.1f;
@@ -177,6 +178,7 @@ struct la_state {
     std::deque<la_bg_job>    bg_queue;
     std::vector<std::thread> bg_workers;
     uint64_t bg_requested = 0, bg_admitted = 0, bg_skipped = 0;
+    uint64_t pf_requested = 0, pf_already = 0;
     std::atomic<uint64_t> bg_bytes{0};
     std::atomic<bool> io_failed{false};
 
@@ -196,6 +198,7 @@ struct la_state {
         if (const char * v = getenv("LA_RESIDENT_FRAC"))  frac      = (float) atof(v);
         if (const char * v = getenv("LA_BETA"))           beta      = (float) atof(v);
         if (const char * v = getenv("LA_GAMMA"))          gamma     = (float) atof(v);
+        if (const char * v = getenv("LA_PREFETCH"))       prefetch  = atoi(v);
         if (const char * v = getenv("LA_PROTECT"))        protect   = atoi(v);
         if (const char * v = getenv("LA_THETA"))          theta     = (float) atof(v);
         if (const char * v = getenv("LA_PRICE_RESIDENT")) price_res = (float) atof(v);
@@ -252,6 +255,8 @@ struct la_state {
                         "substituted/event=%.3f dropped/event=%.3f\n",
                 (unsigned long long) events, served/ev, reads/ev, exact_reads/ev, substituted/ev, dropped/ev);
         if (gpu_frac > 0) fprintf(stderr, "moe-la: gpu_served/event=%.3f\n", gpu_served/ev);
+        if (prefetch > 0) fprintf(stderr, "moe-la: prefetch: requested/event=%.3f already_there/event=%.3f read %.2f GiB\n",
+                                  pf_requested/ev, pf_already/ev, bg_bytes.load()/gib);
         if (async) fprintf(stderr, "moe-la: background: requested/event=%.3f admitted/event=%.3f skipped/event=%.3f read %.2f GiB\n",
                            bg_requested/ev, bg_admitted/ev, bg_skipped/ev, bg_bytes.load()/gib);
         if (real) {
@@ -425,7 +430,8 @@ struct la_state {
             if (L.resident[e] || L.gpu_slot[e] >= 0) continue;
             L.resident[e] = 1;
             L.n_resident++;
-            L.last[e] = L.clock;
+            L.last[e] = L.clock + 1;                      // counts as used by the run about to start
+            L.usage[e] = std::max(L.usage[e], 1.0f);
             bg_admitted++;
         }
     }
@@ -567,7 +573,7 @@ void ggml_moe_la_begin(int layer) {
     s.peak_over = std::max(s.peak_over, over);
     if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
     la_layer & L = *s.layers[layer];
-    if (s.async) s.admit_bg(L);
+    if (s.async || s.prefetch > 0) s.admit_bg(L);
     s.trim(L);
     L.run_start = L.clock + 1;
     L.pending.clear();
@@ -580,7 +586,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
 
     if (!s.real) {
         // no memory is at stake, so model generation: every token is its own run
-        if (s.async) s.admit_bg(L);
+        if (s.async || s.prefetch > 0) s.admit_bg(L);
         s.trim(L);
         L.run_start = L.clock + 1;
     }
@@ -737,6 +743,40 @@ void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out
             case 1: ((int32_t *) out)[j] = slot >= 0 ? slot : (L ? L->n_gpu : 0); break;   // else the all-zero slot
             case 2: ((int32_t *) out)[j] = slot >= 0 ? -1 : e;   break;
             default: ((float *) out)[j]  = slot >= 0 ? 1.0f : 0.0f; break;
+        }
+    }
+}
+
+bool ggml_moe_la_prefetching(void) { return state().enabled && state().prefetch > 0; }
+
+// The router of `layer` applied to the input of the layer before it: a guess at what
+// `layer` will ask for. Start reading the best guesses that are not in memory, so the
+// read overlaps the computation of the layer before.
+void ggml_moe_la_prefetch(int layer, const float * logits, int n_expert) {
+    la_state & s = state();
+    if (!s.enabled || s.prefetch <= 0) return;
+    std::lock_guard<std::mutex> lock(s.mtx);
+    la_layer & L = s.get(layer, n_expert);
+    static thread_local std::vector<int> idx;
+    idx.resize(n_expert);
+    std::iota(idx.begin(), idx.end(), 0);
+    const int m = std::min(s.prefetch, n_expert);
+    std::partial_sort(idx.begin(), idx.begin() + m, idx.end(), [&](int a, int b) { return logits[a] > logits[b]; });
+    for (int j = 0; j < m; ++j) {
+        const int e = idx[j];
+        if (L.resident[e] || L.gpu_slot[e] >= 0) { s.pf_already++; continue; }
+        if (L.bg[e]) continue;
+        L.bg[e] = 1;
+        s.pf_requested++;
+        if (s.real && !L.tensors.empty()) {
+            std::lock_guard<std::mutex> io(s.io_mtx);
+            if (s.bg_workers.empty()) {
+                for (int i = 0; i < s.async_threads; ++i) s.bg_workers.emplace_back([&s] { s.bg_worker(); });
+            }
+            s.bg_queue.push_front({ &L, e });     // ahead of plain background loads: it is needed within this token
+            s.bg_work.notify_all();
+        } else {
+            L.bg_done.push_back(e);               // modelled: there by the time the layer starts
         }
     }
 }

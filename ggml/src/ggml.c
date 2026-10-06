@@ -10964,6 +10964,25 @@ struct ggml_tensor * ggml_moe_la_aux_op(
     return result;
 }
 
+bool ggml_moe_la_prefetch_active(void) {
+    return ggml_moe_la_prefetching();
+}
+
+struct ggml_tensor * ggml_moe_la_prefetch_op(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        int                   layer) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 2, -4);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result->op     = GGML_OP_ARGSORT_THRESH;
+    result->grad   = NULL;
+    result->src[0] = logits;
+    return result;
+}
+
 struct ggml_tensor * ggml_moe_la_topk(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -23365,6 +23384,16 @@ static void ggml_compute_forward_argsort_thresh(
         // load-aware: split a selection between the GPU slots and the CPU
         if (params->ith != 0) return;
         const int la_layer = ggml_get_op_params_i32(dst, 3);
+        if (la_kind == 4) {
+            // read-ahead for the next layer; only while generating, a prompt batch loads everything anyway
+            if (src0->ne[1] <= 4) {
+                for (int64_t i = 0; i < src0->ne[1]; ++i) {
+                    ggml_moe_la_prefetch(la_layer, (const float *)((const char *) src0->data + i*src0->nb[1]), (int) src0->ne[0]);
+                }
+            }
+            *(int32_t *) dst->data = 0;
+            return;
+        }
         const size_t row = la_kind == 3 ? dst->nb[2] : dst->nb[1];
         for (int64_t i = 0; i < src0->ne[1]; ++i) {
             ggml_moe_la_aux(la_layer, la_kind, (const int32_t *)((const char *) src0->data + i*src0->nb[1]),
