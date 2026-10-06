@@ -2520,6 +2520,12 @@ extern "C" {
             struct ggml_tensor  * ids,
             int                   kind,
             int                   layer);
+    // read-ahead (LA_PREFETCH): logits = the router of `layer` applied to the previous layer's input
+    GGML_API bool ggml_moe_la_prefetch_active(void);
+    GGML_API struct ggml_tensor * ggml_moe_la_prefetch_op(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            int                   layer);
     GGML_API struct ggml_tensor * ggml_moe_la_topk(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

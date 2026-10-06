@@ -26,6 +26,8 @@
 //   LA_GAMMA=g             multiplicative bias: a non-resident expert competes with its
 //                          probability times exp(-g), so only experts of similar probability
 //                          replace each other (default 0)
+//   LA_PREFETCH=m          while a layer computes, apply the next layer's router to this layer's
+//                          input and start reading its m best guesses that are not in memory
 //   LA_PROTECT=m           the router's first m experts are always served (default 0)
 //   LA_THETA=t             drop a selected expert whose probability is below
 //                          t * top probability * price of its tier (default 0)
@@ -79,6 +81,10 @@ void ggml_moe_la_begin(int layer);
 // At most k experts are selected, at least one.
 void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int32_t * ids);
 void ggml_moe_la_end(int layer);
+
+bool ggml_moe_la_prefetching(void);
+// logits: the router of `layer` applied to the input of the layer before it (n_expert values)
+void ggml_moe_la_prefetch(int layer, const float * logits, int n_expert);
 
 // VRAM tier. The engine keeps a copy of some experts of each layer in GPU slot
 // tensors and runs them there; the rest run on the CPU as usual.
