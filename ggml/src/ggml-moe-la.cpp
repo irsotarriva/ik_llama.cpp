@@ -88,7 +88,9 @@ typedef int la_fd;
 const la_fd LA_BAD_FD = -1;
 la_fd os_open(const char * path) {
 #if defined(__linux__)
-    return open(path, O_RDONLY | O_DIRECT);
+    int fd = open(path, O_RDONLY | O_DIRECT);
+    if (fd < 0) fd = open(path, O_RDONLY);   // some filesystems refuse O_DIRECT: fall back to the page cache
+    return fd;
 #else
     int fd = open(path, O_RDONLY);
 #if defined(F_NOCACHE)
