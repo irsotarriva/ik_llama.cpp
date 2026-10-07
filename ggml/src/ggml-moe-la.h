@@ -65,6 +65,9 @@ struct ggml_tensor;
 
 bool ggml_moe_la_enabled(void);
 bool ggml_moe_la_real(void);
+// True if `data` is the memory of a tensor taken over in real mode. Such a tensor is only
+// partly backed and must never be read as a whole.
+bool ggml_moe_la_owns(const void * data);
 
 // Real mode, at model load: take over one routed-expert tensor of `layer`
 // ([n_in, n_out, n_expert], stored at `file_offset` of `path`). Changes
