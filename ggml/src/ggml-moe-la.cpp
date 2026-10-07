@@ -167,6 +167,7 @@ struct la_state {
     std::vector<float> profile;       // [n_layers * n_expert], empty when not given
     std::vector<std::unique_ptr<la_layer>> layers;
     std::vector<std::string> files;
+    std::vector<const void *> owned;   // data pointers of the tensors taken over in real mode
     std::mutex mtx;
 
     // reader pool
@@ -534,6 +535,7 @@ bool ggml_moe_la_register(int layer, struct ggml_tensor * tensor, const char * p
     if (it == s.files.end()) s.files.push_back(path);
     L.tensors.push_back(t);
     tensor->data = t.data;
+    s.owned.push_back(t.data);
     return true;
 }
 
@@ -781,4 +783,12 @@ void ggml_moe_la_prefetch(int layer, const float * logits, int n_expert) {
             L.bg_done.push_back(e);               // modelled: there by the time the layer starts
         }
     }
+}
+
+// True for a tensor whose memory the cache owns: only the resident experts are backed, so
+// nothing may read it as a whole (for example to copy it to a GPU).
+bool ggml_moe_la_owns(const void * data) {
+    la_state & s = state();
+    if (!s.enabled || !s.real || !data) return false;
+    return std::find(s.owned.begin(), s.owned.end(), data) != s.owned.end();
 }
