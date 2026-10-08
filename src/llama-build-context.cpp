@@ -1762,6 +1762,8 @@ llm_expert_gating_func_type   gating_op,
         *((float *)(par_g->op_params + 1)) = lctx.model.swiglu_limit(il, false);
         ggml_tensor * exp_g  = ggml_mul_mat_id(ctx, (*la_slots)[2], par_g, ids_g);
         cb(exp_g, "ffn_moe_down_gpu", il);
+        // an expert that ran on the CPU went through a slot that is not its own here: drop that output
+        exp_g = ggml_mul(ctx, exp_g, ggml_moe_la_aux_op(ctx, selected_experts, 3, il));
         // entries that ran on the other side are exact zeros on each side
         experts = ggml_add(ctx, experts, exp_g);
         cb(experts, "ffn_moe_down_both", il);

@@ -5455,9 +5455,11 @@ static bool llm_load_tensors(
             const int n = ggml_moe_la_gpu_slots(il, n_exp, slot_experts[il].data(), n_exp);
             slot_experts[il].resize(n);
             if (n == 0) continue;
+            // a selected expert that runs on the CPU is pointed at a slot its token does not use, and
+            // every id of a token must be distinct, so a layer needs at least n_expert_used slots
+            if (n < (int) model.hparams.n_expert_used) { ggml_moe_la_gpu_drop(il); continue; }
             for (int j = 0; j < 3; ++j) {
-                // one extra slot of zero weights: a selected expert that runs on the CPU is pointed at it
-                ggml_tensor * s = ggml_new_tensor_3d(sctx, exps[j]->type, exps[j]->ne[0], exps[j]->ne[1], n + 1);
+                ggml_tensor * s = ggml_new_tensor_3d(sctx, exps[j]->type, exps[j]->ne[0], exps[j]->ne[1], n);
                 ggml_format_name(s, "blk.%d.la_slots.%d", il, j);
                 model.la_slots[il][j] = s;
             }
@@ -5478,8 +5480,6 @@ static bool llm_load_tensors(
                 ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
                 for (int j = 0; j < 3; ++j) {
                     const size_t stride = ggml_nbytes(exps[j]) / (size_t) exps[j]->ne[2];
-                    const std::vector<char> zeros(stride, 0);
-                    ggml_backend_tensor_set(model.la_slots[il][j], zeros.data(), slot_experts[il].size()*stride, stride);
                     for (size_t slot = 0; slot < slot_experts[il].size(); ++slot) {
                         ggml_backend_tensor_set(model.la_slots[il][j],
                                 (const char *) exps[j]->data + (size_t) slot_experts[il][slot]*stride, slot*stride, stride);
