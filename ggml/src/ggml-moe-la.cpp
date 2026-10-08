@@ -750,11 +750,28 @@ void ggml_moe_la_gpu_cancel(int layer) {
 void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out) {
     la_state & s = state();
     const la_layer * L = (int) s.layers.size() > layer ? s.layers[layer].get() : nullptr;
+    // kind 1: a selected expert that runs on the CPU still needs a slot id on the GPU side. It gets a
+    // slot that no expert of this token uses, a different one each time, and the caller zeroes its
+    // output with the kind 3 mask. The ids of one token must stay distinct: CUDA's kernel groups
+    // tokens by expert and counts each expert at most once per token.
+    const int n_gpu = L ? L->n_gpu : 0;
+    int spare = 0;
+    auto taken = [&](int c) {
+        for (int i = 0; i < k; ++i) {
+            const int e = ids[i];
+            if (L && e >= 0 && e < (int) L->gpu_slot.size() && L->gpu_slot[e] == c) return true;
+        }
+        return false;
+    };
     for (int j = 0; j < k; ++j) {
         const int e = ids[j];
         const int slot = (L && e >= 0 && e < (int) L->gpu_slot.size()) ? L->gpu_slot[e] : -1;
         switch (kind) {
-            case 1: ((int32_t *) out)[j] = slot >= 0 ? slot : (L ? L->n_gpu : 0); break;   // else the all-zero slot
+            case 1:
+                if (slot >= 0) { ((int32_t *) out)[j] = slot; break; }
+                while (spare < n_gpu && taken(spare)) ++spare;
+                ((int32_t *) out)[j] = spare < n_gpu ? spare++ : 0;   // a layer has at least k slots, see llama.cpp
+                break;
             case 2: ((int32_t *) out)[j] = slot >= 0 ? -1 : e;   break;
             default: ((float *) out)[j]  = slot >= 0 ? 1.0f : 0.0f; break;
         }

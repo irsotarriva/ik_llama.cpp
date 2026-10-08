@@ -1373,6 +1373,14 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     // operations with weights are preferably run on the same backend as the weights
     bool offload_enabled = ggml_backend_sched_offload_enabled(sched, tensor->op);
+    // With the load-aware VRAM tier, the CPU side of an expert op gets ids where -1 means "runs in a
+    // GPU slot, skip". Only the CPU kernels know that convention: never hand such an op to a GPU.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * src = tensor->src[i];
+        if (src != NULL && src->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) src->op_params)[2] == -2) {
+            offload_enabled = false;
+        }
+    }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * src = tensor->src[i];
         if (src == NULL) {
