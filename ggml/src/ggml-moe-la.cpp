@@ -31,7 +31,13 @@
 
 namespace {
 
-constexpr size_t LA_PAGE = 4096;   // also the read alignment; file sectors are 512 or 4096
+// The memory page, also the read alignment (file sectors are 512 or 4096). Not a constant:
+// 16 KiB on Apple Silicon, and mprotect refuses anything that is not a whole page.
+#if defined(_WIN32)
+const size_t LA_PAGE = 4096;
+#else
+const size_t LA_PAGE = (size_t) sysconf(_SC_PAGESIZE);
+#endif
 
 inline uintptr_t page_floor(uintptr_t x) { return x & ~(uintptr_t)(LA_PAGE - 1); }
 inline uintptr_t page_ceil (uintptr_t x) { return (x + LA_PAGE - 1) & ~(uintptr_t)(LA_PAGE - 1); }
@@ -58,6 +64,10 @@ bool os_commit(uint8_t * p, size_t size) {
 void os_release(uint8_t * p, size_t size) {
 #if defined(_WIN32)
     VirtualFree(p, size, MEM_DECOMMIT);
+#elif defined(__APPLE__)
+    // MADV_DONTNEED keeps anonymous pages on macOS: they are compressed and swapped instead of
+    // dropped. Mapping fresh pages over the range is what actually gives the memory back.
+    mmap(p, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #else
     madvise(p, size, MADV_DONTNEED);
     mprotect(p, size, PROT_NONE);

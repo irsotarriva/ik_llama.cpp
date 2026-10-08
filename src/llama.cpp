@@ -450,6 +450,8 @@ static size_t llama_get_device_count(const llama_model & model, int initial_coun
     count = ggml_backend_vk_get_device_count();
 #elif defined(GGML_USE_CANN)
     return ggml_backend_cann_get_device_count();
+#elif defined(GGML_USE_METAL)
+    count = 1;   // without this the caller sees no GPU and forces n_gpu_layers to 0
 #endif
 #if defined(GGML_USE_RPC)
     count += model.rpc_servers.size();
@@ -5113,12 +5115,34 @@ static bool llm_load_tensors(
     size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     model.bufs.reserve(n_max_backend_buffer);
 
+    LLAMA_LOG_INFO("%s: weights %s (use_mmap=%d, mmap_buffer=%d)\n", __func__, ml.use_mmap && use_mmap_buffer ? "stay mapped from the file" : "are copied into memory", (int) ml.use_mmap, (int) use_mmap_buffer);
     for (auto & it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx              = it.second;
 
         llama_buf_map bufs;
         bufs.reserve(n_max_backend_buffer);
+
+#ifdef GGML_USE_METAL
+        // A Metal buffer made from the file mapping covers everything between its first and last
+        // tensor and Metal keeps all of it in memory. With the experts on the CPU the Metal tensors
+        // are scattered over the whole file, so the span is the model, not the offloaded part.
+        // In that case give Metal its own copy of just its tensors.
+        bool metal_alias_mmap = true;
+        if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_metal_buffer_type()) {
+            size_t used = 0, span = 0;
+            for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                used += ggml_nbytes(t);
+            }
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                void * addr = nullptr;
+                size_t first, last;
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (last > first) span += last - first;
+            }
+            metal_alias_mmap = span <= 2*used;
+        }
+#endif
 
         // only the mmap region containing the tensors in the model is mapped to the backend buffer
         // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
@@ -5152,7 +5176,7 @@ static bool llm_load_tensors(
             }
         }
 #ifdef GGML_USE_METAL
-        else if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_metal_buffer_type()) {
+        else if (ml.use_mmap && use_mmap_buffer && metal_alias_mmap && buft == ggml_backend_metal_buffer_type()) {
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 void * addr = nullptr;
