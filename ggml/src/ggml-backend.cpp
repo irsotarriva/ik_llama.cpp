@@ -1361,6 +1361,16 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         return cur_backend_id;
     }
 
+    // The load-aware selection and its helper ops are ARGSORT_THRESH nodes with op_params[2] set, and
+    // only the CPU kernel knows about them (it tracks residency and reads experts in). A GPU backend
+    // that implements plain ARGSORT_THRESH (CUDA does) would run its own argsort instead: the experts
+    // are then never loaded and the CPU reads unbacked memory, or the helper's I32 input trips an assert.
+    if (tensor->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) tensor->op_params)[2] != 0) {
+        cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
+        SET_CAUSE(tensor, "1.la");
+        return cur_backend_id;
+    }
+
     // operations with weights are preferably run on the same backend as the weights
     bool offload_enabled = ggml_backend_sched_offload_enabled(sched, tensor->op);
     for (int i = 0; i < GGML_MAX_SRC; i++) {

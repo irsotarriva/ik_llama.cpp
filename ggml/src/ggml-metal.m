@@ -1140,6 +1140,17 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor * t, size_t * offs
 }
 
 static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx, const struct ggml_tensor * op) {
+    // debugging aid: GGML_METAL_NO_OPS=",MUL_MAT_ID,ARGSORT," sends those ops back to the CPU
+    {
+        static const char * no_ops = NULL;
+        static bool no_ops_read = false;
+        if (!no_ops_read) { no_ops = getenv("GGML_METAL_NO_OPS"); no_ops_read = true; }
+        if (no_ops) {
+            char key[64];
+            snprintf(key, sizeof(key), ",%s,", ggml_op_name(op->op));
+            if (strstr(no_ops, key)) return false;
+        }
+    }
 
     for (size_t i = 0, n = 3; i < n; ++i) {
         if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
@@ -1180,8 +1191,14 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
         case GGML_OP_SQR:
         case GGML_OP_SUM_ROWS:
             return true;
-        case GGML_OP_FUSED_MUL_UNARY:
-            return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FUSED_MUL_UNARY: {
+            // the kernels only cover the same-shape SILU/GELU/RELU form without a limit; the sigmoid
+            // gate and the one-gate-per-row form (shared expert, gated attention) must run on the CPU
+            const enum ggml_unary_op uop = (enum ggml_unary_op) op->op_params[0];
+            const float limit = *(const float *) (op->op_params + 1);
+            return ggml_is_contiguous(op->src[0]) && ggml_are_same_shape(op->src[0], op->src[1]) && limit < 1e-6f &&
+                   (uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_GELU || uop == GGML_UNARY_OP_RELU);
+        }
         case GGML_OP_SOFTCAP:
         case GGML_OP_SOFT_CAP_MAX:
             return true; //ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
