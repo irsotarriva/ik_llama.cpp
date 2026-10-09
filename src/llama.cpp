@@ -5474,6 +5474,9 @@ static bool llm_load_tensors(
         } else {
             model.ctxs.push_back(sctx);
             model.bufs.push_back(sbuf);
+            // Without this the scheduler does not tie the slot ops to the GPU: they end up on the CPU and
+            // the slot weights are copied back to host memory on every evaluation.
+            ggml_backend_buffer_set_usage(sbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             for (int il = 0; il < n_la_layers; ++il) {
                 if (!model.la_slots[il][0]) continue;
                 auto & layer = model.layers[il];
