@@ -10964,8 +10964,8 @@ struct ggml_tensor * ggml_moe_la_aux_op(
     return result;
 }
 
-bool ggml_moe_la_prefetch_active(void) {
-    return ggml_moe_la_prefetching();
+bool ggml_moe_la_prefetch_active(int n_tokens) {
+    return ggml_moe_la_prefetching(n_tokens);
 }
 
 struct ggml_tensor * ggml_moe_la_prefetch_op(
@@ -23385,12 +23385,8 @@ static void ggml_compute_forward_argsort_thresh(
         if (params->ith != 0) return;
         const int la_layer = ggml_get_op_params_i32(dst, 3);
         if (la_kind == 4) {
-            // read-ahead for the next layer; only while generating, a prompt batch loads everything anyway
-            if (src0->ne[1] <= 4) {
-                for (int64_t i = 0; i < src0->ne[1]; ++i) {
-                    ggml_moe_la_prefetch(la_layer, (const float *)((const char *) src0->data + i*src0->nb[1]), (int) src0->ne[0]);
-                }
-            }
+            // read-ahead for the next layer: per token while generating, the union for a batch
+            ggml_moe_la_guess(la_layer, (const float *) src0->data, (int) src0->ne[0], (int) src0->ne[1], src0->nb[1]);
             *(int32_t *) dst->data = 0;
             return;
         }

@@ -20,6 +20,13 @@ Measurements behind the advice here are in the project log, `I:\localAIOptimizat
 | `LA_PROFILE_OUT=file` | write the profile of this run (one float per layer and expert). Rewritten every 512 tokens and at exit. If `LA_PROFILE` is also given, the old profile counts as 4,096 tokens of earlier use, so the same path for both keeps a running profile |
 | `LA_GPU_FRAC=0.5` | share of the experts copied into VRAM slots and run on the GPU (needs a profile and a GPU build; dense layers with `-ngl 99 -ot exps=CPU`) |
 
+Reading a prompt (real mode, on by default):
+
+| variable | meaning |
+|---|---|
+| `LA_AHEAD=-1` | while a layer computes a batch, the experts the next layer will probably ask for are read: its router is applied to this layer's input and the union of the first N guesses per token is fetched. -1 = as many as a token uses, 0 = off. More than that reads too much that is not used |
+| `LA_READ_MB=8` | neighbouring experts are read with one request of at most this size |
+
 Others, with their defaults: `LA_THETA` (0; drop weak experts, not useful on stock models),
 `LA_GAMMA` (0; multiplicative form of the bias), `LA_EVICT` (`freq`; `lru` for least recently used),
 `LA_DECAY` (decay of the request counts), `LA_PRICE_RESIDENT` (0.1), `LA_EXCESS_RAM` (0; extra price
@@ -27,7 +34,25 @@ for RAM against VRAM), `LA_IO_THREADS` (8), `LA_PREFETCH` (0; read one layer ahe
 `LA_ASYNC_RATE`, `LA_ASYNC_QUEUE`, `LA_ASYNC_THREADS` (background loading of substituted experts,
 costs speed in real mode), `LA_STATS=file` (append one JSON line of counters at exit).
 
+## The lookup table (`--defer-ple`)
+
+A token needs 16 rows of the table of Qwen3.8-Flash-Next, each a page of the file. Pages used before
+stay in spare memory as long as the system has any; these settings cover the rest:
+
+| variable | meaning |
+|---|---|
+| `LA_ROW_THREADS=8` | the rows of a batch are asked for at once on this many threads before the layers run. 0 = off |
+| `LA_ROW_PROFILE=file` | one count per page of the table: how often it was needed. Read at start, rewritten every 1,024 tokens. 7 MB for the 27 GiB table |
+| `LA_ROW_RAM_MB=2048` | at start, read the most needed pages of that profile in the background, up to this much. Default 0. The pages stay file-backed: the system drops them for free when memory is short, so they need not be counted in the budget |
+
+They do not depend on `LA_ENABLE`.
+
 ## Command-line options to use with it
+
+- `llama-server -ub 1024` (with `-b 2048`): prompt chunks of 1,024 tokens instead of 512. The larger the
+  chunk the fewer times the experts are read and the better the kernels do: on Qwen3.8-Flash-Next with
+  8 cores, 26.8 tok/s at 512, 34.7 at 1,024, 36.4 at 2,048, 41.3 at 4,096, for 1.35 GiB of compute
+  buffer per 512 tokens of chunk.
 
 - `--defer-ple` for models with a large embedding lookup table (Qwen3.8-Flash-Next: 27 GiB). Without
   it the engine reads every page of the table into memory at load on Windows.
@@ -42,8 +67,9 @@ costs speed in real mode), `LA_STATS=file` (append one JSON line of counters at 
 ## Sizing the resident share
 
 Private memory of the process is, to within a few hundred MiB:
-`LA_RESIDENT_FRAC` x routed experts + KV cache + compute buffers (about 1.4 GiB) + checkpoints and
-prompt cache as they fill. The dense weights (a few GiB) are mapped from the file on top of that.
+`LA_RESIDENT_FRAC` x routed experts + KV cache + compute buffers (about 1.4 GiB per 512 tokens of
+`-ub`) + checkpoints and prompt cache as they fill. During a prompt batch the cache also holds what
+two layers need beyond their share (about 1 GiB on Qwen3.8-Flash-Next at 55% resident). The dense weights (a few GiB) are mapped from the file on top of that.
 Leave what the other programs on the machine use, measured, not guessed: a server sized past it
 pushes them into the page file.
 
@@ -61,3 +87,8 @@ or run the server with `LA_PROFILE_OUT` and use it. The file is `n_layers x n_ex
 An event is one layer of one token. `reads/event` times the number of layers is disk reads per token;
 `exact_reads` is what exact routing would have read; `substituted` is how many of the router's choices
 were replaced by resident experts. `prefill` is what the profile loaded before the first token.
+
+    moe-la: batch of 1024 tokens: 27.5 s, of which 2.3 s waiting for the disk; read 3.23 GiB after routing (30.0 experts/layer) and 10.13 GiB ahead (1308 experts not used)
+
+One line per prompt batch of 32 tokens or more. `after routing` is what the guess for the next layer
+missed and the batch had to wait for; `not used` is what the guess read for nothing.

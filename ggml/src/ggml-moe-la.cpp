@@ -142,6 +142,8 @@ struct la_layer {
     std::vector<uint8_t> bg;                        // per expert: 1 while a background read is wanted or running
     std::vector<std::pair<float, int>> bg_want;     // this run of tokens: (probability, expert)
     std::vector<int> bg_done;                       // read, waiting to be admitted (real: guarded by io_mtx)
+    std::vector<int> ahead;                         // experts being read ahead for the run about to start
+    int      ahead_pending = 0;                     // their read jobs still queued or running (guarded by io_mtx)
     float    bg_credit  = 0;                        // modelled mode: reads this layer may still start
     int      n_gpu      = 0;
     int      n_resident = 0;
@@ -150,7 +152,9 @@ struct la_layer {
     uint64_t run_start  = 0;
 };
 
-struct la_job { la_tensor * t; int expert; };
+// `count` consecutive experts of one tensor, read with one request. owner: the layer that is reading
+// ahead, null for a read somebody is waiting for.
+struct la_job { la_tensor * t; int expert; int count; la_layer * owner; };
 struct la_bg_job { la_layer * L; int expert; };
 
 struct la_state {
@@ -172,6 +176,9 @@ struct la_state {
     float  decay     = 0.98f;   // applied to the request counts every 16 tokens
     float  excess_ram = 0.0f;
     int    io_threads = 8;
+    int    ahead_k   = -1;      // batches: experts per token guessed for the next layer and read ahead; -1 = as many as a token uses, 0 = off
+    size_t read_span = (size_t) 8 << 20;   // most bytes of neighbouring experts read with one request
+    int    last_k    = 0;
     std::string profile_path;
     std::string stats_path;
     std::string profile_out;          // LA_PROFILE_OUT: write what the router asked for, as a profile
@@ -186,6 +193,7 @@ struct la_state {
     std::mutex              io_mtx;
     std::condition_variable io_work, io_done;
     std::deque<la_job>      io_queue;
+    std::deque<la_job>      ahead_queue;      // served when io_queue is empty
     std::vector<std::thread> io_workers;
     int  io_pending = 0;
     bool io_stop = false;
@@ -203,6 +211,11 @@ struct la_state {
     std::atomic<uint64_t> read_bytes{0};
     double read_wait_s = 0, prefill_s = 0;
     int    peak_over = 0;      // most experts held beyond the budget at one time
+    std::atomic<uint64_t> ahead_bytes{0};
+    uint64_t ahead_experts = 0, ahead_unused = 0;
+    // one pass over the layers (a batch of tokens), for the log line of long batches
+    double   pass_t0 = 0, pass_wait0 = 0;
+    uint64_t pass_bytes0 = 0, pass_ahead0 = 0, pass_unused0 = 0, pass_reads0 = 0;
     uint64_t prefill_bytes = 0;
 
     la_state() {
@@ -226,6 +239,8 @@ struct la_state {
         if (const char * v = getenv("LA_EVICT"))          evict_freq = strcmp(v, "lru") != 0;
         if (const char * v = getenv("LA_DECAY"))          decay     = (float) atof(v);
         if (const char * v = getenv("LA_IO_THREADS"))     io_threads = std::max(1, atoi(v));
+        if (const char * v = getenv("LA_AHEAD"))          ahead_k   = atoi(v);
+        if (const char * v = getenv("LA_READ_MB"))        read_span = (size_t) std::max(0.0, atof(v) * 1048576.0);
         if (const char * v = getenv("LA_PROFILE"))        profile_path = v;
         if (const char * v = getenv("LA_STATS"))          stats_path   = v;
         if (const char * v = getenv("LA_PROFILE_OUT"))    profile_out  = v;
@@ -318,6 +333,8 @@ struct la_state {
                     read_bytes.load()/gib, read_wait_s, read_wait_s > 0 ? read_bytes.load()/gib/read_wait_s : 0.0,
                     (unsigned long long) evicted, prefill_bytes/gib, prefill_s);
             fprintf(stderr, "moe-la: at most %d experts over the budget at one time\n", peak_over);
+            if (ahead_experts > 0) fprintf(stderr, "moe-la: read ahead %.2f GiB, %llu experts, %llu of them not used by the batch\n",
+                                           ahead_bytes.load()/gib, (unsigned long long) ahead_experts, (unsigned long long) ahead_unused);
         }
         write_profile(true);
         if (!stats_path.empty()) {
@@ -387,10 +404,30 @@ struct la_state {
 
     // ---- real mode I/O ----
 
-    static void expert_span(const la_tensor & t, int e, uint8_t *& lo, uint8_t *& hi) {
+    static void expert_span(const la_tensor & t, int e, int count, uint8_t *& lo, uint8_t *& hi) {
         const uintptr_t s = (uintptr_t) t.data + (uintptr_t) e * t.stride;
         lo = (uint8_t *) page_floor(s);
-        hi = (uint8_t *) std::min<uintptr_t>(page_ceil(s + t.stride), (uintptr_t) t.region_end);
+        hi = (uint8_t *) std::min<uintptr_t>(page_ceil(s + (uintptr_t) count * t.stride), (uintptr_t) t.region_end);
+    }
+
+    // Queue the reads of `experts` (ascending). Neighbours in the file go into one request of at most
+    // read_span bytes: the drive is asked for fewer, larger pieces. Call with io_mtx held.
+    void queue_reads(la_layer & L, const std::vector<int> & experts, la_layer * owner) {
+        if (io_workers.empty()) {
+            for (int i = 0; i < io_threads; ++i) io_workers.emplace_back([this] { worker(); });
+        }
+        std::deque<la_job> & q = owner ? ahead_queue : io_queue;
+        for (auto & t : L.tensors) {
+            const int most = (int) std::max<size_t>(1, read_span / std::max<size_t>(1, t.stride));
+            for (size_t i = 0; i < experts.size(); ) {
+                size_t j = i + 1;
+                while (j < experts.size() && experts[j] == experts[j - 1] + 1 && (int) (j - i) < most) ++j;
+                q.push_back({ &t, experts[i], (int) (j - i), owner });
+                if (owner) owner->ahead_pending++; else io_pending++;
+                i = j;
+            }
+        }
+        io_work.notify_all();
     }
 
     void worker() {
@@ -399,35 +436,30 @@ struct la_state {
             la_job job;
             {
                 std::unique_lock<std::mutex> lock(io_mtx);
-                io_work.wait(lock, [&] { return io_stop || !io_queue.empty(); });
+                io_work.wait(lock, [&] { return io_stop || !io_queue.empty() || !ahead_queue.empty(); });
                 if (io_stop) break;
-                job = io_queue.front();
-                io_queue.pop_front();
+                std::deque<la_job> & q = io_queue.empty() ? ahead_queue : io_queue;
+                job = q.front();
+                q.pop_front();
             }
             size_t n = 0;
-            const bool ok = read_one(fds, *job.t, job.expert, n);
+            const bool ok = read_one(fds, *job.t, job.expert, job.count, n);
             if (!ok) io_failed.store(true);
-            read_bytes.fetch_add(n);
+            (job.owner ? ahead_bytes : read_bytes).fetch_add(n);
             {
                 std::lock_guard<std::mutex> lock(io_mtx);
-                if (--io_pending == 0) io_done.notify_all();
+                if (job.owner) { if (--job.owner->ahead_pending == 0) io_done.notify_all(); }
+                else if (--io_pending == 0) io_done.notify_all();
             }
         }
     }
 
     void read_experts(la_layer & L, const std::vector<int> & experts) {
         if (L.tensors.empty() || experts.empty()) return;
+        std::vector<int> sorted(experts);
+        std::sort(sorted.begin(), sorted.end());
         std::unique_lock<std::mutex> lock(io_mtx);
-        if (io_workers.empty()) {
-            for (int i = 0; i < io_threads; ++i) io_workers.emplace_back([this] { worker(); });
-        }
-        for (int e : experts) {
-            for (auto & t : L.tensors) {
-                io_queue.push_back({ &t, e });
-                io_pending++;
-            }
-        }
-        io_work.notify_all();
+        queue_reads(L, sorted, nullptr);
         io_done.wait(lock, [&] { return io_pending == 0; });
         if (io_failed.load()) {
             fprintf(stderr, "moe-la: reading an expert failed\n");
@@ -435,11 +467,48 @@ struct la_state {
         }
     }
 
-    bool read_one(std::vector<la_fd> & fds, const la_tensor & t, int expert, size_t & n_out) {
+    // Reading ahead for a batch of tokens. `want` marks the experts the next layer will probably ask
+    // for (see ggml_moe_la_guess). The ones it does not hold are read while this layer computes, in
+    // file order, and the layer takes them in when its own run starts.
+    void read_ahead(la_layer & L, const std::vector<uint8_t> & want) {
+        if (L.tensors.empty() || !L.ahead.empty()) return;
+        for (int e = 0; e < (int) want.size(); ++e) {
+            if (want[e] && !L.resident[e] && L.gpu_slot[e] < 0 && !L.bg[e]) L.ahead.push_back(e);
+        }
+        if (L.ahead.empty()) return;
+        for (int e : L.ahead) L.bg[e] = 1;
+        std::lock_guard<std::mutex> lock(io_mtx);
+        queue_reads(L, L.ahead, &L);
+    }
+
+    // The run of `L` is about to start: wait for what was read ahead for it and take it in. Those
+    // experts count as not used yet, so the ones the run does not touch are the first to go.
+    bool admit_ahead(la_layer & L) {
+        if (L.ahead.empty()) return false;
+        {
+            std::unique_lock<std::mutex> lock(io_mtx);
+            io_done.wait(lock, [&] { return L.ahead_pending == 0; });
+        }
+        if (io_failed.load()) {
+            fprintf(stderr, "moe-la: reading an expert failed\n");
+            abort();
+        }
+        for (int e : L.ahead) {
+            L.bg[e] = 0;
+            if (L.resident[e]) continue;
+            L.resident[e] = 1;
+            L.n_resident++;
+            L.last[e] = L.clock;
+        }
+        ahead_experts += L.ahead.size();
+        return true;
+    }
+
+    bool read_one(std::vector<la_fd> & fds, const la_tensor & t, int expert, int count, size_t & n_out) {
         if ((int) fds.size() <= t.file_id) fds.resize(t.file_id + 1, LA_BAD_FD);
         if (fds[t.file_id] == LA_BAD_FD) fds[t.file_id] = os_open(files[t.file_id].c_str());
         uint8_t * lo, * hi;
-        expert_span(t, expert, lo, hi);
+        expert_span(t, expert, count, lo, hi);
         n_out = (size_t) (hi - lo);
         // lo may sit a little before data (then it holds the tail of the tensor stored before this one)
         const uint64_t off = (uint64_t) ((int64_t) t.file_off + (int64_t) (lo - t.data));
@@ -462,7 +531,7 @@ struct la_state {
             bool ok = true;
             for (auto & t : job.L->tensors) {
                 size_t n = 0;
-                ok = ok && read_one(fds, t, job.expert, n);
+                ok = ok && read_one(fds, t, job.expert, 1, n);
                 bg_bytes.fetch_add(n);
             }
             if (!ok) io_failed.store(true);
@@ -629,8 +698,15 @@ void ggml_moe_la_begin(int layer) {
     s.peak_over = std::max(s.peak_over, over);
     if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
     la_layer & L = *s.layers[layer];
+    if (layer == 0) {
+        s.pass_t0 = now_s(); s.pass_wait0 = s.read_wait_s; s.pass_bytes0 = s.read_bytes.load();
+        s.pass_ahead0 = s.ahead_bytes.load(); s.pass_unused0 = s.ahead_unused; s.pass_reads0 = s.reads;
+    }
     if (s.async || s.prefetch > 0) s.admit_bg(L);
-    s.trim(L);
+    const double t0 = now_s();
+    const bool ahead = s.admit_ahead(L);
+    s.read_wait_s += now_s() - t0;
+    if (!ahead) s.trim(L);       // what was read ahead is over the budget until the run ends
     L.run_start = L.clock + 1;
     L.pending.clear();
 }
@@ -677,6 +753,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
         memcpy(picked, wanted, sizeof(int) * kk);
     }
 
+    s.last_k = kk;
     int n_served = 0;
     const float top = probs[picked[0]];
     for (int j = 0; j < kk; ++j) {
@@ -727,7 +804,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
         if (L.gpu_slot[e] >= 0) { s.gpu_served++; continue; }
         if (L.resident[e]) continue;
         s.reads++;
-        if (L.n_resident >= L.cap) {
+        if (!s.real && L.n_resident >= L.cap) {
             int victim = -1;
             for (int x = 0; x < n_expert; ++x) {
                 if (!L.resident[x] || L.bg[x] || L.last[x] >= L.run_start) continue;
@@ -753,13 +830,41 @@ void ggml_moe_la_end(int layer) {
     std::lock_guard<std::mutex> lock(s.mtx);
     if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
     la_layer & L = *s.layers[layer];
-    if (s.real && !L.pending.empty()) {
-        const double t0 = now_s();
-        s.read_experts(L, L.pending);
-        s.read_wait_s += now_s() - t0;
+    const int n_tokens = (int) (L.clock + 1 - L.run_start);
+    if (s.real) {
+        // Room for what the run reads is made here, when everything the run uses is known: an expert
+        // evicted for the first token of a batch could be one that a later token needs, and it
+        // would be read twice. Only experts the run does not use can go, the coldest first.
+        const int n_expert = (int) L.resident.size();
+        for (int e : L.ahead) if (L.last[e] < L.run_start) s.ahead_unused++;
+        L.ahead.clear();
+        while (L.n_resident > L.cap) {
+            int victim = -1;
+            for (int x = 0; x < n_expert; ++x) {
+                if (!L.resident[x] || L.bg[x] || L.last[x] >= L.run_start) continue;
+                if (victim < 0 || s.colder(L, x, victim)) victim = x;
+            }
+            if (victim < 0) break;
+            L.resident[victim] = 0;
+            L.n_resident--;
+            s.release_expert(L, victim);
+        }
+        if (!L.pending.empty()) {
+            const double t0 = now_s();
+            s.read_experts(L, L.pending);
+            s.read_wait_s += now_s() - t0;
+        }
+        if (layer + 1 == (int) s.layers.size() && n_tokens >= 32) {
+            const double gib = 1024.0*1024.0*1024.0;
+            fprintf(stderr, "moe-la: batch of %d tokens: %.1f s, of which %.1f s waiting for the disk; read %.2f GiB after routing "
+                            "(%.1f experts/layer) and %.2f GiB ahead (%llu experts not used)\n",
+                    n_tokens, now_s() - s.pass_t0, s.read_wait_s - s.pass_wait0, (s.read_bytes.load() - s.pass_bytes0)/gib,
+                    (double) (s.reads - s.pass_reads0) / s.layers.size(), (s.ahead_bytes.load() - s.pass_ahead0)/gib,
+                    (unsigned long long) (s.ahead_unused - s.pass_unused0));
+        }
     }
     L.pending.clear();
-    if (s.async) s.request_bg(L, (int) (L.clock + 1 - L.run_start));
+    if (s.async) s.request_bg(L, n_tokens);
     L.run_start = L.clock + 1;
 }
 bool ggml_moe_la_gpu(void) { return state().enabled && state().gpu_frac > 0; }
@@ -821,7 +926,36 @@ void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out
     }
 }
 
-bool ggml_moe_la_prefetching(void) { return state().enabled && state().prefetch > 0; }
+bool ggml_moe_la_prefetching(int n_tokens) {
+    const la_state & s = state();
+    return s.enabled && (s.prefetch > 0 || (s.real && s.ahead_k != 0 && n_tokens > 1));
+}
+
+// The same guess for a whole batch: the union over its tokens is read ahead. A long prompt batch needs
+// nearly every expert of a layer, a short one a part of them that the router of the layer names well
+// enough even from the input of the layer before.
+void ggml_moe_la_guess(int layer, const float * logits, int n_expert, int n_rows, size_t row_bytes) {
+    la_state & s = state();
+    if (!s.enabled) return;
+    if (n_rows < 2) {
+        if (n_rows == 1) ggml_moe_la_prefetch(layer, logits, n_expert);
+        return;
+    }
+    if (!s.real || s.ahead_k == 0) return;
+    std::lock_guard<std::mutex> lock(s.mtx);
+    la_layer & L = s.get(layer, n_expert);
+    const int m = std::min(n_expert, s.ahead_k > 0 ? s.ahead_k : std::max(1, s.last_k));
+    static thread_local std::vector<int> idx;
+    std::vector<uint8_t> want(n_expert, 0);
+    for (int r = 0; r < n_rows; ++r) {
+        const float * row = (const float *) ((const char *) logits + (size_t) r * row_bytes);
+        idx.resize(n_expert);
+        std::iota(idx.begin(), idx.end(), 0);
+        if (m < n_expert) std::nth_element(idx.begin(), idx.begin() + m, idx.end(), [&](int a, int b) { return row[a] > row[b]; });
+        for (int j = 0; j < m; ++j) want[idx[j]] = 1;
+    }
+    s.read_ahead(L, want);
+}
 
 // The router of `layer` applied to the input of the layer before it: a guess at what
 // `layer` will ask for. Start reading the best guesses that are not in memory, so the

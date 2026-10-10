@@ -1616,7 +1616,7 @@ llm_expert_gating_func_type   gating_op,
     cb(selected_experts, "ffn_moe_topk", il);
 
     // load-aware read-ahead: guess what the next layer will route to from this layer's input
-    if (graph && ggml_moe_la_prefetch_active() && n_expert_used < n_expert && il >= 0 &&
+    if (graph && ggml_moe_la_prefetch_active((int) n_tokens) && n_expert_used < n_expert && il >= 0 &&
         il + 1 < (int) lctx.model.layers.size() && lctx.model.layers[il + 1].ffn_gate_inp &&
         !lctx.model.layers[il + 1].ffn_gate_inp->extra) {
         ggml_tensor * next_logits = llm_build_lora_mm(lctx, ctx, lctx.model.layers[il + 1].ffn_gate_inp, input);
