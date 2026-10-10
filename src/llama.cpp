@@ -5442,7 +5442,10 @@ static bool llm_load_tensors(
         const int n_la_layers = (int) model.layers.size();
         model.la_slots.assign(n_la_layers, { nullptr, nullptr, nullptr });
         std::vector<std::vector<int32_t>> slot_experts(n_la_layers);
-        struct ggml_init_params ip = { ggml_tensor_overhead()*(size_t)(3*n_la_layers + 8), nullptr, true };
+        struct ggml_init_params ip = { ggml_tensor_overhead()*(size_t)(6*n_la_layers + 8), nullptr, true };
+        model.la_transit.assign(n_la_layers, { nullptr, nullptr, nullptr });
+        std::vector<int> transit_like;      // layers that own a set of scratch tensors
+        size_t transit_bytes = 0;
         ggml_context * sctx = slot_buft ? ggml_init(ip) : nullptr;
         size_t n_slots = 0;
         for (int il = 0; sctx && il < n_la_layers; ++il) {
@@ -5467,12 +5470,33 @@ static bool llm_load_tensors(
                 model.la_slots[il][j] = s;
             }
             n_slots += n;
+            if (ggml_moe_la_gpu_batch() > 0) {
+                int like = -1;
+                for (int o : transit_like) {
+                    ggml_tensor * oe[3] = { model.layers[o].ffn_gate_exps, model.layers[o].ffn_up_exps, model.layers[o].ffn_down_exps };
+                    bool same = true;
+                    for (int j = 0; j < 3; ++j) same = same && oe[j]->type == exps[j]->type && ggml_are_same_shape(oe[j], exps[j]);
+                    if (same) { like = o; break; }
+                }
+                if (like < 0) {
+                    for (int j = 0; j < 3; ++j) {
+                        ggml_tensor * s = ggml_new_tensor_3d(sctx, exps[j]->type, exps[j]->ne[0], exps[j]->ne[1], exps[j]->ne[2]);
+                        ggml_format_name(s, "blk.%d.la_transit.%d", il, j);
+                        model.la_transit[il][j] = s;
+                        transit_bytes += ggml_nbytes(s);
+                    }
+                    transit_like.push_back(il);
+                } else {
+                    model.la_transit[il] = model.la_transit[like];
+                }
+            }
         }
         ggml_backend_buffer_t sbuf = (sctx && n_slots > 0) ? ggml_backend_alloc_ctx_tensors_from_buft(sctx, slot_buft) : nullptr;
         if (!sbuf) {
             LLAMA_LOG_WARN("%s: load-aware VRAM tier: no GPU slots could be allocated, running without it\n", __func__);
             for (int il = 0; il < n_la_layers; ++il) ggml_moe_la_gpu_drop(il);
             model.la_slots.clear();
+            model.la_transit.clear();
             if (sctx) ggml_free(sctx);
         } else {
             model.ctxs.push_back(sctx);
@@ -5480,17 +5504,31 @@ static bool llm_load_tensors(
             // Without this the scheduler does not tie the slot ops to the GPU: they end up on the CPU and
             // the slot weights are copied back to host memory on every evaluation.
             ggml_backend_buffer_set_usage(sbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // the scratch tensors are read at indices nothing was written to (see ggml_moe_la_transit)
+            ggml_backend_buffer_clear(sbuf, 0);
+            for (int il = 0; il < n_la_layers; ++il) {
+                if (model.la_transit[il][0]) ggml_moe_la_gpu_transit(il, model.la_transit[il][0], model.la_transit[il][1], model.la_transit[il][2]);
+            }
+            if (transit_bytes > 0) {
+                LLAMA_LOG_INFO("%s: load-aware VRAM tier: %zu sets of scratch tensors for prompt batches (%.1f MiB)\n", __func__,
+                        transit_like.size(), transit_bytes/1024.0/1024.0);
+            }
             for (int il = 0; il < n_la_layers; ++il) {
                 if (!model.la_slots[il][0]) continue;
                 auto & layer = model.layers[il];
                 ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+                const void * host[3];
+                size_t strides[3];
                 for (int j = 0; j < 3; ++j) {
                     const size_t stride = ggml_nbytes(exps[j]) / (size_t) exps[j]->ne[2];
                     for (size_t slot = 0; slot < slot_experts[il].size(); ++slot) {
                         ggml_backend_tensor_set(model.la_slots[il][j],
                                 (const char *) exps[j]->data + (size_t) slot_experts[il][slot]*stride, slot*stride, stride);
                     }
+                    host[j]    = exps[j]->data;
+                    strides[j] = stride;
                 }
+                ggml_moe_la_gpu_slot_tensors(il, model.la_slots[il].data(), host, strides);
             }
             LLAMA_LOG_INFO("%s: load-aware VRAM tier: %zu experts in GPU slots (%.1f MiB)\n", __func__, n_slots,
                     ggml_backend_buffer_get_size(sbuf)/1024.0/1024.0);

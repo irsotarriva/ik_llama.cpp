@@ -1671,6 +1671,16 @@ llm_expert_gating_func_type   gating_op,
         la_slots = &lctx.model.la_slots[il];
         sel_exec = ggml_moe_la_aux_op(ctx, selected_experts, 2, il);
     }
+    // a prompt batch: the experts without a slot go through scratch tensors on the GPU instead of the CPU
+    bool la_transit = false;
+    if (la_slots && ggml_moe_la_gpu_batch() > 0 && n_tokens >= ggml_moe_la_gpu_batch() && !up_gate_exps &&
+        !up_exps_b && !gate_exps_b && il < (int) lctx.model.la_transit.size() && lctx.model.la_transit[il][0]) {
+        la_transit = true;
+        sel_exec  = ggml_moe_la_transit_op(ctx, selected_experts, il, gate_exps, up_exps, down_exps);
+        gate_exps = lctx.model.la_transit[il][0];
+        up_exps   = lctx.model.la_transit[il][1];
+        down_exps = lctx.model.la_transit[il][2];
+    }
 
     if (weight_before_ffn) {
         // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
@@ -1754,6 +1764,10 @@ llm_expert_gating_func_type   gating_op,
     ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, sel_exec); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
+    if (la_transit) {
+        // an entry that has a slot went through an index that is not its own here: drop that output
+        experts = ggml_mul(ctx, experts, ggml_moe_la_aux_op(ctx, selected_experts, 6, il));
+    }
     if (la_slots) {
         ggml_tensor * ids_g  = ggml_moe_la_aux_op(ctx, selected_experts, 1, il);
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx, (*la_slots)[0], cur, ids_g);
