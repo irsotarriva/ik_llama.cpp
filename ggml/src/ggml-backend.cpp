@@ -1371,6 +1371,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         return cur_backend_id;
     }
 
+    // The CPU side of the load-aware VRAM tier sums its experts before the result goes to the GPU.
+    if (strncmp(tensor->name, "la_cpu", 6) == 0) {
+        cur_backend_id = sched->n_backends - 1;
+        SET_CAUSE(tensor, "1.la");
+        return cur_backend_id;
+    }
+
     // operations with weights are preferably run on the same backend as the weights
     bool offload_enabled = ggml_backend_sched_offload_enabled(sched, tensor->op);
     // With the load-aware VRAM tier, the CPU side of an expert op gets ids where -1 means "runs in a

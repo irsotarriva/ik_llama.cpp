@@ -1666,7 +1666,8 @@ llm_expert_gating_func_type   gating_op,
     // load-aware VRAM tier: experts that have a GPU slot run there, the others on the CPU
     ggml_tensor * sel_exec = selected_experts;
     const std::array<ggml_tensor *, 3> * la_slots = nullptr;
-    if (ggml_moe_la_gpu_active() && n_expert_used < n_expert && !weight_before_ffn && type_op == LLM_FFN_SILU &&
+    if (ggml_moe_la_gpu_active() && !ggml_moe_la_gpu_plain((int) n_tokens) &&
+        n_expert_used < n_expert && !weight_before_ffn && type_op == LLM_FFN_SILU &&
         il >= 0 && il < (int) lctx.model.la_slots.size() && lctx.model.la_slots[il][0]) {
         la_slots = &lctx.model.la_slots[il];
         sel_exec = ggml_moe_la_aux_op(ctx, selected_experts, 2, il);
@@ -1768,19 +1769,33 @@ llm_expert_gating_func_type   gating_op,
         // an entry that has a slot went through an index that is not its own here: drop that output
         experts = ggml_mul(ctx, experts, ggml_moe_la_aux_op(ctx, selected_experts, 6, il));
     }
+    // The output of each side is [n_embd, n_expert_used, n_tokens]. Adding the two as they are sends
+    // the CPU side's across in full for every layer (196 MB for a 3,000-token prompt of Qwen3.6). When
+    // the weighted sum over the experts is the next step anyway, each side does its own and only
+    // [n_embd, n_tokens] crosses.
+    ggml_tensor * la_gpu_out = nullptr;
     if (la_slots) {
         ggml_tensor * ids_g  = ggml_moe_la_aux_op(ctx, selected_experts, 1, il);
-        ggml_tensor * gate_g = ggml_mul_mat_id(ctx, (*la_slots)[0], cur, ids_g);
-        ggml_tensor * up_g   = ggml_mul_mat_id(ctx, (*la_slots)[1], cur, ids_g);
-        ggml_tensor * par_g  = ggml_fused_mul_unary(ctx, gate_g, up_g, GGML_UNARY_OP_SILU);
+        ggml_tensor * par_g;
+        if (lctx.cparams.fused_moe_up_gate && (*la_slots)[0]->type == (*la_slots)[1]->type) {
+            par_g = ggml_moe_up_gate(ctx, (*la_slots)[1], (*la_slots)[0], cur, ids_g, GGML_UNARY_OP_SILU);
+        } else {
+            ggml_tensor * gate_g = ggml_mul_mat_id(ctx, (*la_slots)[0], cur, ids_g);
+            ggml_tensor * up_g   = ggml_mul_mat_id(ctx, (*la_slots)[1], cur, ids_g);
+            par_g = ggml_fused_mul_unary(ctx, gate_g, up_g, GGML_UNARY_OP_SILU);
+        }
         *((float *)(par_g->op_params + 1)) = lctx.model.swiglu_limit(il, false);
         ggml_tensor * exp_g  = ggml_mul_mat_id(ctx, (*la_slots)[2], par_g, ids_g);
         cb(exp_g, "ffn_moe_down_gpu", il);
         // an expert that ran on the CPU went through a slot that is not its own here: drop that output
         exp_g = ggml_mul(ctx, exp_g, ggml_moe_la_aux_op(ctx, selected_experts, 3, il));
-        // entries that ran on the other side are exact zeros on each side
-        experts = ggml_add(ctx, experts, exp_g);
-        cb(experts, "ffn_moe_down_both", il);
+        if (!la_transit && !down_exps_b && !down_exps_s && lctx.cparams.fused_mmad) {
+            la_gpu_out = exp_g;
+        } else {
+            // entries that ran on the other side are exact zeros on each side
+            experts = ggml_add(ctx, experts, exp_g);
+            cb(experts, "ffn_moe_down_both", il);
+        }
     }
 
     if (down_exps_b) {
@@ -1800,6 +1815,18 @@ llm_expert_gating_func_type   gating_op,
     }
 
     if (!weight_before_ffn) {
+        if (lctx.cparams.fused_mmad && la_gpu_out) {
+            ggml_tensor * out_c = ggml_mul_multi_add(ctx, experts, weights);
+            ggml_set_name(out_c, "la_cpu_weighted");            // the scheduler keeps this name on the CPU
+            ggml_tensor * out_g = ggml_mul_multi_add(ctx, la_gpu_out, weights);
+            experts = ggml_add(ctx, out_c, out_g);
+            cb(experts, "ffn_moe_weighted", il);
+            if (add_input) {
+                experts = ggml_add(ctx, experts, input);
+                cb(experts, "ffn_out_with_inp", il);
+            }
+            return experts;
+        }
         if (lctx.cparams.fused_mmad) {
             experts = ggml_mul_multi_add(ctx, experts, weights);
             cb(experts, "ffn_moe_weighted", il);
