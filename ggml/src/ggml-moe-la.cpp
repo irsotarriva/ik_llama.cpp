@@ -263,6 +263,43 @@ struct la_state {
         for (auto & w : bg_workers) if (w.joinable()) w.join();
     }
 
+    // LA_PROFILE_OUT: the file LA_PROFILE reads, one float per (layer, expert): how often the router asked
+    // for the expert, per token. Counted from what the router wanted, not from what was served. A profile
+    // given with LA_PROFILE counts as PRIOR_TOKENS tokens of earlier use, so the file follows the use of
+    // the machine across runs without forgetting. Written every 512 tokens as well as at exit, because a
+    // server is usually stopped by ending its process.
+    void write_profile(bool say) {
+        if (profile_out.empty() || layers.empty()) return;
+        const double PRIOR_TOKENS = 4096.0;
+        size_t n_expert = 0;
+        for (auto & L : layers) if (L) n_expert = std::max(n_expert, L->asked.size());
+        if (n_expert == 0) return;
+        const bool prior = profile.size() == layers.size() * n_expert;
+        std::vector<float> out(layers.size() * n_expert, 0.0f);
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (!layers[il]) continue;
+            const double tokens = (double) layers[il]->clock + (prior ? PRIOR_TOKENS : 0.0);
+            if (tokens <= 0) continue;
+            for (size_t e = 0; e < layers[il]->asked.size(); ++e) {
+                const double seen = layers[il]->asked[e] + (prior ? PRIOR_TOKENS * profile[il * n_expert + e] : 0.0);
+                out[il * n_expert + e] = (float) (seen / tokens);
+            }
+        }
+        const std::string tmp = profile_out + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "wb");
+        if (!f) {
+            if (say) fprintf(stderr, "moe-la: cannot write profile %s\n", profile_out.c_str());
+            return;
+        }
+        const bool ok = fwrite(out.data(), sizeof(float), out.size(), f) == out.size();
+        fclose(f);
+        if (ok) {
+            remove(profile_out.c_str());
+            rename(tmp.c_str(), profile_out.c_str());
+        }
+        if (say) fprintf(stderr, "moe-la: profile of %zu layers x %zu experts written to %s\n", layers.size(), n_expert, profile_out.c_str());
+    }
+
     void report() {
         if (!enabled || events == 0) return;
         const double ev = (double) events;
@@ -282,25 +319,7 @@ struct la_state {
                     (unsigned long long) evicted, prefill_bytes/gib, prefill_s);
             fprintf(stderr, "moe-la: at most %d experts over the budget at one time\n", peak_over);
         }
-        if (!profile_out.empty() && !layers.empty()) {
-            // The profile LA_PROFILE reads: one float per (layer, expert), how often the router asked for
-            // the expert per token of this run. Written from what the router wanted, not from what was served.
-            size_t n_expert = 0;
-            for (auto & L : layers) if (L) n_expert = std::max(n_expert, L->asked.size());
-            std::vector<float> out(layers.size() * n_expert, 0.0f);
-            for (size_t il = 0; il < layers.size(); ++il) {
-                if (!layers[il]) continue;
-                const double tokens = std::max<double>(1.0, (double) layers[il]->clock);
-                for (size_t e = 0; e < layers[il]->asked.size(); ++e) out[il * n_expert + e] = (float) (layers[il]->asked[e] / tokens);
-            }
-            if (FILE * f = fopen(profile_out.c_str(), "wb")) {
-                fwrite(out.data(), sizeof(float), out.size(), f);
-                fclose(f);
-                fprintf(stderr, "moe-la: profile of %zu layers x %zu experts written to %s\n", layers.size(), n_expert, profile_out.c_str());
-            } else {
-                fprintf(stderr, "moe-la: cannot write profile %s\n", profile_out.c_str());
-            }
-        }
+        write_profile(true);
         if (!stats_path.empty()) {
             if (FILE * f = fopen(stats_path.c_str(), "a")) {
                 fprintf(f, "{\"real\":%d,\"resident_frac\":%g,\"beta\":%g,\"theta\":%g,\"price_resident\":%g,"
@@ -698,6 +717,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     if (L.run_start == 0) L.run_start = L.clock + 1;
     L.clock++;
     for (int j = 0; j < kk; ++j) { L.usage[wanted[j]] += 1.0f; L.asked[wanted[j]]++; }
+    if (!s.profile_out.empty() && layer == 0 && L.clock > 0 && (L.clock & 511) == 0) s.write_profile(false);
     if (s.decay < 1.0f && (L.clock & 15) == 0) {
         for (float & u : L.usage) u *= s.decay;
     }
