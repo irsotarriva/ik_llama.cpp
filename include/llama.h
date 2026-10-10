@@ -926,6 +926,12 @@ extern "C" {
                        llama_pos   p1);
 
     // Removes all tokens that do not belong to the specified sequence
+    // Frees every cell that carries seq_id, whatever other sequences share it, and returns how many.
+    // llama_kv_cache_seq_rm only takes the id off a cell, and a cell another sequence still holds
+    // stays visible to that sequence. This is how a tab is taken out of a tabbed context, where the
+    // cells of each tab also belong to the agent's sequence (examples/tab-test).
+    LLAMA_API int32_t llama_kv_cache_seq_rm_cells(struct llama_context * ctx, llama_seq_id seq_id);
+
     LLAMA_API void llama_kv_cache_seq_keep(
             struct llama_context * ctx,
                     llama_seq_id   seq_id);
