@@ -1125,7 +1125,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             if (deferred_file) {
                 ++n_deferred;
             }
-            const size_t file_prefetch = (prefetch && !deferred_file) ? (size_t) -1 : 0;
+            // Load-aware real mode reads the experts itself, into its own memory: prefetching the mapping
+            // would pull the same experts into the page cache a second time (38 GiB of one file on
+            // Qwen3.8-Flash-Next), which fills the RAM and pushes other programs out. The dense weights
+            // are then read when first used.
+            const size_t file_prefetch = (prefetch && !deferred_file && !ggml_moe_la_real_active()) ? (size_t) -1 : 0;
             std::unique_ptr<llama_mmap> mapping(new llama_mmap(file.get(), file_prefetch, ggml_is_numa(), use_thp));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
