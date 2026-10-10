@@ -48,7 +48,15 @@ enum oaicompat_type {
 };
 
 
+// A position in the prompt that the client wants a context checkpoint at ("cache_breakpoints").
+struct server_cache_breakpoint {
+    int32_t n_tokens = 0;       // the checkpoint is taken after this many prompt tokens
+    bool    persist  = false;   // also keep the state on disk (needs LA_CACHE_DIR)
+    int64_t ttl_s    = 0;       // ... for this long after its last use
+};
+
 struct slot_params {
+    std::vector<server_cache_breakpoint> cache_breakpoints;
     bool stream = true;
     bool include_usage = false;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt
@@ -363,6 +371,8 @@ struct server_prompt_checkpoint {
 
     // the checkpoint taken at the end of the prompt; kept while another entry can be evicted instead
     bool prompt_end = false;
+    // taken at a position the client asked for; kept in the same way
+    bool client = false;
 
     std::vector<uint8_t> data;
 

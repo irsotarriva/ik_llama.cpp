@@ -520,6 +520,8 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
+void resolve_cache_breakpoints(const llama_vocab * vocab, json & data, const json & prompt, const server_tokens & tokens);
+
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special);
 
 // Assuming raw_buffer has .data() and .size() members

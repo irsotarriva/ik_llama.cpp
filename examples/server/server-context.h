@@ -1,3 +1,4 @@
+#include "server-cache-store.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "speculative.h"
@@ -120,6 +121,7 @@ struct server_slot {
 
     llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
+    int  breakpoint_hit = -1;       // index into params.cache_breakpoints of the one the batch being decoded ends at
     bool image_just_processed = false;
 
     // sampling
@@ -271,6 +273,9 @@ struct server_context {
     server_response queue_results;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    server_cache_store cache_store;     // states the clients asked to keep on disk
+    void on_cache_breakpoint(server_slot & slot);
+    void cache_store_restore(server_slot & slot, const server_tokens & prompt_tokens);
 
     server_metrics metrics;
 

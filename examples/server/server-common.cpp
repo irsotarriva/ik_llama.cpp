@@ -696,6 +696,23 @@ json oaicompat_chat_params_parse(
     if (!messages.is_array()) {
         throw std::runtime_error("Expected 'messages' to be an array");
     }
+    // "cache_control" on a message or on one of its content parts: a cache breakpoint at the end of that message
+    std::vector<json> cache_marks(messages.size());
+    for (size_t im = 0; im < messages.size(); ++im) {
+        const json & msg = messages[im];
+        if (!msg.is_object()) {
+            continue;
+        }
+        if (msg.contains("cache_control") && msg.at("cache_control").is_object()) {
+            cache_marks[im] = msg.at("cache_control");
+        } else if (msg.contains("content") && msg.at("content").is_array()) {
+            for (const auto & part : msg.at("content")) {
+                if (part.is_object() && part.contains("cache_control") && part.at("cache_control").is_object()) {
+                    cache_marks[im] = part.at("cache_control");
+                }
+            }
+        }
+    }
     for (auto& msg : messages) {
         std::string role = json_value(msg, "role", std::string());
         if (role != "assistant" && !msg.contains("content")) {
@@ -861,6 +878,32 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+
+    // Where a marked message ends in the prompt: the prompt of the messages up to it, if the full
+    // prompt starts with that (a template may write an earlier message differently once others follow).
+    json cache_breakpoints = json_value(body, "cache_breakpoints", json::array());
+    for (size_t im = 0; im < cache_marks.size() && im < inputs.messages.size(); ++im) {
+        if (cache_marks[im].is_null()) {
+            continue;
+        }
+        try {
+            common_chat_templates_inputs part = inputs;
+            part.messages.resize(im + 1);
+            part.add_generation_prompt = false;
+            const std::string head = common_chat_templates_apply(opt.tmpls.get(), part).prompt;
+            if (!head.empty() && head.size() < chat_params.prompt.size() && chat_params.prompt.compare(0, head.size(), head) == 0) {
+                json bp = { {"chars", head.size()} };
+                if (cache_marks[im].contains("ttl"))     bp["ttl"]     = cache_marks[im].at("ttl");
+                if (cache_marks[im].contains("persist")) bp["persist"] = cache_marks[im].at("persist");
+                cache_breakpoints.push_back(bp);
+            }
+        } catch (const std::exception &) {
+            // the template does not accept the shortened conversation: no breakpoint there
+        }
+    }
+    if (!cache_breakpoints.empty()) {
+        llama_params["cache_breakpoints"] = cache_breakpoints;
+    }
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {
@@ -1953,6 +1996,32 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
+// Cache breakpoints given as a number of characters of the prompt become a number of tokens. One that
+// does not fall between two tokens of the prompt is left without "n_tokens" and is ignored later.
+void resolve_cache_breakpoints(const llama_vocab * vocab, json & data, const json & prompt, const server_tokens & tokens) {
+    if (!data.contains("cache_breakpoints") || !data.at("cache_breakpoints").is_array() || !prompt.is_string()) {
+        return;
+    }
+    const std::string text = prompt.get<std::string>();
+    for (auto & bp : data.at("cache_breakpoints")) {
+        if (!bp.is_object() || bp.contains("n_tokens") || !bp.contains("chars")) {
+            continue;
+        }
+        const size_t chars = bp.at("chars").get<size_t>();
+        if (chars == 0 || chars >= text.size()) {
+            continue;
+        }
+        const llama_tokens head = common_tokenize(vocab, text.substr(0, chars), true, true);
+        bool same = head.size() < tokens.size();
+        for (size_t i = 0; same && i < head.size(); ++i) {
+            same = tokens[i] == head[i];
+        }
+        if (same) {
+            bp["n_tokens"] = (int32_t) head.size();
+        }
+    }
+}
+
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {

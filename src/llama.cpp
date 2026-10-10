@@ -13157,6 +13157,12 @@ static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, con
     return res;
 }
 
+void llama_kv_cache_seq_set_tokens(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_tokens) {
+    if (ctx->model.hparams.ple_n_heads > 0) {
+        ctx->ple_hist[seq_id].assign(tokens, tokens + n_tokens);
+    }
+}
+
 static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     if (!llama_state_io_supported(ctx, __func__, 0, dest_seq_id)) {
         return 0;
