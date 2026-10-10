@@ -10952,7 +10952,7 @@ struct ggml_tensor * ggml_moe_la_aux_op(
         int                   kind,
         int                   layer) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
-    struct ggml_tensor * result = kind == 3
+    struct ggml_tensor * result = (kind == 3 || kind == 6)
         ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ids->ne[0], ids->ne[1])
         : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
     ggml_set_op_params_i32(result, 0, 0);
@@ -10961,6 +10961,34 @@ struct ggml_tensor * ggml_moe_la_aux_op(
     result->op     = GGML_OP_ARGSORT_THRESH;
     result->grad   = NULL;
     result->src[0] = ids;
+    return result;
+}
+
+int ggml_moe_la_gpu_batch(void) {
+    return ggml_moe_la_gpu_batch_min();
+}
+
+void ggml_moe_la_gpu_slot_tensors(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]) {
+    ggml_moe_la_set_slots(layer, slots, host, stride);
+}
+
+void ggml_moe_la_gpu_transit(int layer, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down) {
+    ggml_moe_la_set_transit(layer, gate, up, down);
+}
+
+// ids for the scratch tensors of a prompt batch; running it copies the experts the batch needs there.
+// gate, up, down: the expert tensors of the layer in host memory.
+struct ggml_tensor * ggml_moe_la_transit_op(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int                   layer,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * down) {
+    struct ggml_tensor * result = ggml_moe_la_aux_op(ctx, ids, 5, layer);
+    result->src[1] = gate;
+    result->src[2] = up;
+    result->src[3] = down;
     return result;
 }
 
@@ -23390,7 +23418,18 @@ static void ggml_compute_forward_argsort_thresh(
             *(int32_t *) dst->data = 0;
             return;
         }
-        const size_t row = la_kind == 3 ? dst->nb[2] : dst->nb[1];
+        if (la_kind == 5) {
+            const void * src[3];
+            size_t stride[3];
+            for (int t = 0; t < 3; ++t) {
+                src[t]    = dst->src[t + 1]->data;
+                stride[t] = ggml_nbytes(dst->src[t + 1]) / (size_t) dst->src[t + 1]->ne[2];
+            }
+            ggml_moe_la_transit(la_layer, (const int32_t *) src0->data, (int) src0->ne[0], (int) src0->ne[1], src0->nb[1],
+                                src, stride, (int32_t *) dst->data, dst->nb[1]);
+            return;
+        }
+        const size_t row = (la_kind == 3 || la_kind == 6) ? dst->nb[2] : dst->nb[1];
         for (int64_t i = 0; i < src0->ne[1]; ++i) {
             ggml_moe_la_aux(la_layer, la_kind, (const int32_t *)((const char *) src0->data + i*src0->nb[1]),
                             (int) src0->ne[0], (char *) dst->data + i*row);

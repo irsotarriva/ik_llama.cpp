@@ -638,6 +638,9 @@ struct llama_model {
 
     // load-aware VRAM tier: per layer, GPU copies of some experts (gate, up, down), or nulls
     std::vector<std::array<struct ggml_tensor *, 3>> la_slots;
+    // GPU scratch tensors for prompt batches, shaped like a layer's expert tensors; layers with the
+    // same shapes and types share one set
+    std::vector<std::array<struct ggml_tensor *, 3>> la_transit;
 
     // contexts where the model tensors metadata is stored
     std::vector<struct ggml_context *> ctxs;

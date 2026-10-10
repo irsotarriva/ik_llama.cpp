@@ -105,7 +105,22 @@ void ggml_moe_la_gpu_cancel(int layer);
 //           the last slot, where the engine keeps an all-zero expert so they contribute nothing
 //   kind 2: int32 expert id of each entry that runs on the CPU, -1 for the others
 //   kind 3: float 1 for each entry that runs on the GPU, 0 for the others
+//   kind 6: float 1 for each entry that runs through the scratch tensors of a prompt batch, 0 for the others
 void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out);
+
+// VRAM tier, prompt batches. A batch of at least ggml_moe_la_gpu_batch_min() tokens (0 = never) runs
+// the experts that have no slot on the GPU as well: the engine gives each layer three scratch tensors
+// there, shaped like its expert tensors, and ggml_moe_la_transit copies what the batch needs into them.
+int  ggml_moe_la_gpu_batch_min(void);
+// The slot tensors of a layer (gate, up, down) and the host memory and bytes per expert of the tensors
+// they were filled from. With LA_GPU_ADAPT the cache rewrites slots while the model generates.
+void ggml_moe_la_set_slots(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]);
+void ggml_moe_la_set_transit(int layer, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down);
+// ids: the selection of n_tokens tokens, k entries each, rows ids_stride bytes apart. src, stride: the
+// host memory of the three expert tensors and their bytes per expert. out: the index of each entry in
+// the scratch tensors, rows out_stride bytes apart.
+void ggml_moe_la_transit(int layer, const int32_t * ids, int k, int n_tokens, size_t ids_stride,
+                         const void * const src[3], const size_t stride[3], int32_t * out, size_t out_stride);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,6 @@
 #include "ggml-moe-la.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <atomic>
@@ -138,6 +139,10 @@ struct la_layer {
     std::vector<la_tensor> tensors;   // real mode
     std::vector<int> pending;         // experts to read before this run of tokens ends
     std::vector<int16_t> gpu_slot;    // per expert: its VRAM slot, or -1
+    struct ggml_tensor * transit[3] = { nullptr, nullptr, nullptr };   // GPU scratch for prompt batches (gate, up, down)
+    struct ggml_tensor * slots[3]   = { nullptr, nullptr, nullptr };   // the slot tensors, for LA_GPU_ADAPT
+    const uint8_t *      host[3]    = { nullptr, nullptr, nullptr };   // the expert tensors as the loader mapped them
+    size_t               host_stride[3] = { 0, 0, 0 };
     // background loading: experts the router asked for that were substituted away
     std::vector<uint8_t> bg;                        // per expert: 1 while a background read is wanted or running
     std::vector<std::pair<float, int>> bg_want;     // this run of tokens: (probability, expert)
@@ -179,6 +184,16 @@ struct la_state {
     int    ahead_k   = -1;      // batches: experts per token guessed for the next layer and read ahead; -1 = as many as a token uses, 0 = off
     size_t read_span = (size_t) 8 << 20;   // most bytes of neighbouring experts read with one request
     int    last_k    = 0;
+    int    last_layer = -1;    // the last layer whose experts the cache holds (real mode)
+    int    gpu_batch = 0;       // VRAM tier: batches of at least this many tokens run every expert on the GPU; 0 = never.
+                                // Off: on an RTX 5090 with 8 CPU threads it read prompts 20 to 35% slower than the CPU side
+    int    gpu_adapt = 0;       // VRAM tier: every this many generated tokens a layer may swap one slot; 0 = the slots stay as loaded
+    float  adapt_margin = 1.5f; // ... if the expert coming in is asked for this many times as often as the one going out
+    uint64_t swaps = 0;
+    uint64_t transit_bytes = 0, transit_runs = 0;
+    double   transit_s = 0;
+    uint64_t pass_transit0 = 0;
+    double   pass_transit_s0 = 0;
     std::string profile_path;
     std::string stats_path;
     std::string profile_out;          // LA_PROFILE_OUT: write what the router asked for, as a profile
@@ -240,6 +255,9 @@ struct la_state {
         if (const char * v = getenv("LA_DECAY"))          decay     = (float) atof(v);
         if (const char * v = getenv("LA_IO_THREADS"))     io_threads = std::max(1, atoi(v));
         if (const char * v = getenv("LA_AHEAD"))          ahead_k   = atoi(v);
+        if (const char * v = getenv("LA_GPU_BATCH"))      gpu_batch = atoi(v);
+        if (const char * v = getenv("LA_GPU_ADAPT"))      gpu_adapt = atoi(v);
+        if (const char * v = getenv("LA_GPU_ADAPT_MARGIN")) adapt_margin = (float) atof(v);
         if (const char * v = getenv("LA_READ_MB"))        read_span = (size_t) std::max(0.0, atof(v) * 1048576.0);
         if (const char * v = getenv("LA_PROFILE"))        profile_path = v;
         if (const char * v = getenv("LA_STATS"))          stats_path   = v;
@@ -323,6 +341,9 @@ struct la_state {
                         "substituted/event=%.3f dropped/event=%.3f\n",
                 (unsigned long long) events, served/ev, reads/ev, exact_reads/ev, substituted/ev, dropped/ev);
         if (gpu_frac > 0) fprintf(stderr, "moe-la: gpu_served/event=%.3f\n", gpu_served/ev);
+        if (gpu_adapt > 0) fprintf(stderr, "moe-la: %llu slot swaps\n", (unsigned long long) swaps);
+        if (transit_runs > 0) fprintf(stderr, "moe-la: prompt batches sent %.2f GiB of experts to the GPU in %.2f s (%llu layer runs)\n",
+                                      transit_bytes/gib, transit_s, (unsigned long long) transit_runs);
         if (prefetch > 0) fprintf(stderr, "moe-la: prefetch: requested/event=%.3f already_there/event=%.3f read %.2f GiB\n",
                                   pf_requested/ev, pf_already/ev, bg_bytes.load()/gib);
         if (async) fprintf(stderr, "moe-la: background: requested/event=%.3f admitted/event=%.3f skipped/event=%.3f read %.2f GiB\n",
@@ -605,6 +626,49 @@ struct la_state {
         }
     }
 
+    // The slots follow the use of the model. The expert without a slot that is asked for most takes the
+    // slot of the slot expert that is asked for least, when the difference is clear. In real mode the
+    // two change places: the one going out is copied from the GPU into the memory the one coming in
+    // gives up, so nothing is read from the disk and the memory budget does not move. Called from the
+    // selection of a single token: the GPU has finished the token before and has not started this one.
+    void adapt_slots(la_layer & L) {
+        if (!L.slots[0] || L.n_gpu <= 0) return;
+        const int n_expert = (int) L.gpu_slot.size();
+        int in = -1, out = -1;
+        for (int e = 0; e < n_expert; ++e) {
+            if (L.gpu_slot[e] >= 0) {
+                if (out < 0 || L.usage[e] < L.usage[out]) out = e;
+            } else if (!L.bg[e] && (!real || L.resident[e])) {
+                if (in < 0 || L.usage[e] > L.usage[in]) in = e;
+            }
+        }
+        if (in < 0 || out < 0 || L.usage[in] < adapt_margin * L.usage[out] + 0.5f) return;
+        const int slot = L.gpu_slot[out];
+        for (int t = 0; t < 3; ++t) {
+            if (real) {
+                la_tensor & T = L.tensors[t];
+                uint8_t * lo, * hi;
+                expert_span(T, out, 1, lo, hi);
+                os_commit(lo, (size_t) (hi - lo));
+                ggml_backend_tensor_get(L.slots[t], T.data + (size_t) out * T.stride, (size_t) slot * T.stride, T.stride);
+                ggml_backend_tensor_set(L.slots[t], T.data + (size_t) in * T.stride, (size_t) slot * T.stride, T.stride);
+            } else {
+                ggml_backend_tensor_set(L.slots[t], L.host[t] + (size_t) in * L.host_stride[t],
+                                        (size_t) slot * L.host_stride[t], L.host_stride[t]);
+            }
+        }
+        if (real) {
+            release_expert(L, in);
+            evicted--;                    // not an eviction
+            L.resident[in]  = 0;
+            L.resident[out] = 1;
+            L.last[out]     = L.clock;
+        }
+        L.gpu_slot[in]  = (int16_t) slot;
+        L.gpu_slot[out] = -1;
+        swaps++;
+    }
+
     void release_expert(la_layer & L, int e) {
         for (auto & t : L.tensors) {
             // keep the pages shared with the neighbouring experts
@@ -670,6 +734,7 @@ void ggml_moe_la_prefill(void) {
     for (auto & Lp : s.layers) {
         if (!Lp || Lp->tensors.empty()) continue;
         n_tensors += (int) Lp->tensors.size();
+        s.last_layer = (int) (&Lp - &s.layers[0]);
         std::vector<int> want;
         for (int e = 0; e < (int) Lp->resident.size(); ++e) if (Lp->resident[e]) want.push_back(e);
         n_experts += (int) want.size();
@@ -701,6 +766,7 @@ void ggml_moe_la_begin(int layer) {
     if (layer == 0) {
         s.pass_t0 = now_s(); s.pass_wait0 = s.read_wait_s; s.pass_bytes0 = s.read_bytes.load();
         s.pass_ahead0 = s.ahead_bytes.load(); s.pass_unused0 = s.ahead_unused; s.pass_reads0 = s.reads;
+        s.pass_transit0 = s.transit_bytes; s.pass_transit_s0 = s.transit_s;
     }
     if (s.async || s.prefetch > 0) s.admit_bg(L);
     const double t0 = now_s();
@@ -854,15 +920,22 @@ void ggml_moe_la_end(int layer) {
             s.read_experts(L, L.pending);
             s.read_wait_s += now_s() - t0;
         }
-        if (layer + 1 == (int) s.layers.size() && n_tokens >= 32) {
+        if (s.gpu_adapt > 0 && n_tokens == 1 && L.clock % (uint64_t) s.gpu_adapt == 0 && (int) L.tensors.size() == 3) s.adapt_slots(L);
+        if (layer == s.last_layer && n_tokens >= 32) {
             const double gib = 1024.0*1024.0*1024.0;
             fprintf(stderr, "moe-la: batch of %d tokens: %.1f s, of which %.1f s waiting for the disk; read %.2f GiB after routing "
                             "(%.1f experts/layer) and %.2f GiB ahead (%llu experts not used)\n",
                     n_tokens, now_s() - s.pass_t0, s.read_wait_s - s.pass_wait0, (s.read_bytes.load() - s.pass_bytes0)/gib,
-                    (double) (s.reads - s.pass_reads0) / s.layers.size(), (s.ahead_bytes.load() - s.pass_ahead0)/gib,
+                    (double) (s.reads - s.pass_reads0) / (s.last_layer + 1), (s.ahead_bytes.load() - s.pass_ahead0)/gib,
                     (unsigned long long) (s.ahead_unused - s.pass_unused0));
+            if (s.transit_bytes > s.pass_transit0) {
+                // counts the layers before this one: the last layer sends its experts after this line
+                fprintf(stderr, "moe-la:   %.2f GiB of experts sent to the GPU in %.2f s\n",
+                        (s.transit_bytes - s.pass_transit0)/gib, s.transit_s - s.pass_transit_s0);
+            }
         }
     }
+    if (!s.real && s.gpu_adapt > 0 && n_tokens == 1 && L.clock % (uint64_t) s.gpu_adapt == 0 && L.host[0]) s.adapt_slots(L);
     L.pending.clear();
     if (s.async) s.request_bg(L, n_tokens);
     L.run_start = L.clock + 1;
@@ -921,9 +994,76 @@ void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out
                 ((int32_t *) out)[j] = spare < n_gpu ? spare++ : 0;   // a layer has at least k slots, see llama.cpp
                 break;
             case 2: ((int32_t *) out)[j] = slot >= 0 ? -1 : e;   break;
+            case 6: ((float *) out)[j]   = (e >= 0 && slot < 0) ? 1.0f : 0.0f; break;
             default: ((float *) out)[j]  = slot >= 0 ? 1.0f : 0.0f; break;
         }
     }
+}
+
+int ggml_moe_la_gpu_batch_min(void) {
+    const la_state & s = state();
+    return s.enabled && s.gpu_frac > 0 ? s.gpu_batch : 0;
+}
+
+void ggml_moe_la_set_slots(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]) {
+    la_state & s = state();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
+    la_layer & L = *s.layers[layer];
+    for (int t = 0; t < 3; ++t) {
+        L.slots[t] = slots[t];
+        L.host[t]  = (const uint8_t *) host[t];
+        L.host_stride[t] = stride[t];
+    }
+}
+
+void ggml_moe_la_set_transit(int layer, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down) {
+    la_state & s = state();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
+    la_layer & L = *s.layers[layer];
+    L.transit[0] = gate; L.transit[1] = up; L.transit[2] = down;
+}
+
+// A prompt batch on a machine with a GPU. The experts of the batch that have no slot are in host
+// memory by now (the selection of this layer has run). They are copied into the scratch tensors of
+// the layer, at their own index, and the whole layer then runs on the GPU. out: for each selected
+// entry the index to use there. An entry that has a slot (or was dropped) gets an index its token
+// does not use; the caller zeroes its output with the kind 6 mask. Whatever the scratch tensors
+// hold at such an index is finite: zeros from the start, or an expert of an earlier layer.
+void ggml_moe_la_transit(int layer, const int32_t * ids, int k, int n_tokens, size_t ids_stride,
+                         const void * const src[3], const size_t stride[3], int32_t * out, size_t out_stride) {
+    la_state & s = state();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    la_layer & L = *s.layers[layer];
+    const int n_expert = (int) L.gpu_slot.size();
+    std::vector<uint8_t> need(n_expert, 0);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int32_t * row = (const int32_t *) ((const char *) ids + (size_t) i * ids_stride);
+        int32_t * o = (int32_t *) ((char *) out + (size_t) i * out_stride);
+        int spare = 0;
+        auto taken = [&](int c) { for (int j = 0; j < k; ++j) if (row[j] == c) return true; return false; };
+        for (int j = 0; j < k; ++j) {
+            const int e = row[j];
+            if (e >= 0 && e < n_expert && L.gpu_slot[e] < 0) { need[e] = 1; o[j] = e; continue; }
+            while (spare < n_expert && taken(spare)) ++spare;
+            o[j] = spare < n_expert ? spare++ : 0;
+        }
+    }
+    const double t0 = now_s();
+    for (int t = 0; t < 3; ++t) {
+        for (int e = 0; e < n_expert; ) {
+            if (!need[e]) { ++e; continue; }
+            int j = e + 1;
+            while (j < n_expert && need[j]) ++j;
+            ggml_backend_tensor_set(L.transit[t], (const char *) src[t] + (size_t) e * stride[t],
+                                    (size_t) e * stride[t], (size_t) (j - e) * stride[t]);
+            s.transit_bytes += (uint64_t) (j - e) * stride[t];
+            e = j;
+        }
+    }
+    s.transit_s += now_s() - t0;
+    s.transit_runs++;
 }
 
 bool ggml_moe_la_prefetching(int n_tokens) {
