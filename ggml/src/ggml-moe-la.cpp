@@ -134,6 +134,7 @@ struct la_layer {
     std::vector<uint8_t>  resident;   // per expert
     std::vector<uint64_t> last;       // clock of the last time an expert was served
     std::vector<float>    usage;      // decayed count of how often the router asked for an expert
+    std::vector<uint32_t> asked;      // plain count of the same, for LA_PROFILE_OUT
     std::vector<la_tensor> tensors;   // real mode
     std::vector<int> pending;         // experts to read before this run of tokens ends
     std::vector<int16_t> gpu_slot;    // per expert: its VRAM slot, or -1
@@ -173,6 +174,7 @@ struct la_state {
     int    io_threads = 8;
     std::string profile_path;
     std::string stats_path;
+    std::string profile_out;          // LA_PROFILE_OUT: write what the router asked for, as a profile
 
     std::vector<float> profile;       // [n_layers * n_expert], empty when not given
     std::vector<std::unique_ptr<la_layer>> layers;
@@ -226,6 +228,7 @@ struct la_state {
         if (const char * v = getenv("LA_IO_THREADS"))     io_threads = std::max(1, atoi(v));
         if (const char * v = getenv("LA_PROFILE"))        profile_path = v;
         if (const char * v = getenv("LA_STATS"))          stats_path   = v;
+        if (const char * v = getenv("LA_PROFILE_OUT"))    profile_out  = v;
         if (!profile_path.empty()) {
             if (FILE * f = fopen(profile_path.c_str(), "rb")) {
                 fseek(f, 0, SEEK_END);
@@ -279,6 +282,25 @@ struct la_state {
                     (unsigned long long) evicted, prefill_bytes/gib, prefill_s);
             fprintf(stderr, "moe-la: at most %d experts over the budget at one time\n", peak_over);
         }
+        if (!profile_out.empty() && !layers.empty()) {
+            // The profile LA_PROFILE reads: one float per (layer, expert), how often the router asked for
+            // the expert per token of this run. Written from what the router wanted, not from what was served.
+            size_t n_expert = 0;
+            for (auto & L : layers) if (L) n_expert = std::max(n_expert, L->asked.size());
+            std::vector<float> out(layers.size() * n_expert, 0.0f);
+            for (size_t il = 0; il < layers.size(); ++il) {
+                if (!layers[il]) continue;
+                const double tokens = std::max<double>(1.0, (double) layers[il]->clock);
+                for (size_t e = 0; e < layers[il]->asked.size(); ++e) out[il * n_expert + e] = (float) (layers[il]->asked[e] / tokens);
+            }
+            if (FILE * f = fopen(profile_out.c_str(), "wb")) {
+                fwrite(out.data(), sizeof(float), out.size(), f);
+                fclose(f);
+                fprintf(stderr, "moe-la: profile of %zu layers x %zu experts written to %s\n", layers.size(), n_expert, profile_out.c_str());
+            } else {
+                fprintf(stderr, "moe-la: cannot write profile %s\n", profile_out.c_str());
+            }
+        }
         if (!stats_path.empty()) {
             if (FILE * f = fopen(stats_path.c_str(), "a")) {
                 fprintf(f, "{\"real\":%d,\"resident_frac\":%g,\"beta\":%g,\"theta\":%g,\"price_resident\":%g,"
@@ -305,6 +327,7 @@ struct la_state {
         L->resident.assign(n_expert, 0);
         L->last.assign(n_expert, 0);
         L->usage.assign(n_expert, 0.0f);
+        L->asked.assign(n_expert, 0);
         L->bg.assign(n_expert, 0);
         L->gpu_slot.assign(n_expert, -1);
         return L;
@@ -674,7 +697,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     // recently served expert that this run of tokens does not use makes room
     if (L.run_start == 0) L.run_start = L.clock + 1;
     L.clock++;
-    for (int j = 0; j < kk; ++j) L.usage[wanted[j]] += 1.0f;
+    for (int j = 0; j < kk; ++j) { L.usage[wanted[j]] += 1.0f; L.asked[wanted[j]]++; }
     if (s.decay < 1.0f && (L.clock & 15) == 0) {
         for (float & u : L.usage) u *= s.decay;
     }
