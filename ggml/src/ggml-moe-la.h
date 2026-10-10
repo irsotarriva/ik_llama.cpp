@@ -112,6 +112,9 @@ void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out
 // the experts that have no slot on the GPU as well: the engine gives each layer three scratch tensors
 // there, shaped like its expert tensors, and ggml_moe_la_transit copies what the batch needs into them.
 int  ggml_moe_la_gpu_batch_min(void);
+// True if a batch of n_tokens tokens should not use the tier at all: every expert is whole in host
+// memory, and the engine's own way of sending such a batch to the GPU is faster.
+bool ggml_moe_la_batch_plain(int n_tokens);
 // The slot tensors of a layer (gate, up, down) and the host memory and bytes per expert of the tensors
 // they were filled from. With LA_GPU_ADAPT the cache rewrites slots while the model generates.
 void ggml_moe_la_set_slots(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]);

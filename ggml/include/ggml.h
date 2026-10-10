@@ -2517,6 +2517,8 @@ extern "C" {
     // prompt batches on the GPU: smallest batch that uses the scratch tensors (0 = never), the scratch
     // tensors of a layer, and the op that fills them and returns the ids to use with them
     GGML_API int  ggml_moe_la_gpu_batch(void);
+    // a batch of n_tokens tokens that should run without the tier (see ggml-moe-la.h)
+    GGML_API bool ggml_moe_la_gpu_plain(int n_tokens);
     GGML_API void ggml_moe_la_gpu_slot_tensors(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]);
     GGML_API void ggml_moe_la_gpu_transit(int layer, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down);
     GGML_API struct ggml_tensor * ggml_moe_la_transit_op(

@@ -185,11 +185,22 @@ struct la_state {
     size_t read_span = (size_t) 8 << 20;   // most bytes of neighbouring experts read with one request
     int    last_k    = 0;
     int    last_layer = -1;    // the last layer whose experts the cache holds (real mode)
-    int    gpu_batch = 0;       // VRAM tier: batches of at least this many tokens run every expert on the GPU; 0 = never.
-                                // Off: on an RTX 5090 with 8 CPU threads it read prompts 20 to 35% slower than the CPU side
+    // VRAM tier, batches of at least this many tokens (0 = never). A GPU build already sends the expert
+    // products of a big batch to the GPU when the experts are whole in host memory, at the price of
+    // copying the layer's experts to the card for every batch. Without the real cache such a batch
+    // takes that route instead of the tier's split. RTX 5090, 8 CPU threads, 2,986-token prompt, 50%
+    // and 80% of the experts in slots: one batch 1,885 and 1,817 tok/s against 940 and 1,436 for the
+    // split; batches of 1,024 749 and 741 against 858 and 1,443. So it pays from about 1,200 tokens
+    // at 50% and 2,200 at 80%, hence the default.
+    // With the real cache the experts are only partly in memory and that route is closed; the scratch
+    // tensors replace it, but only when LA_GPU_BATCH is given: they were 19% slower than the CPU side
+    // in batches of 1,024 and 3 to 18% faster with the prompt in one batch.
+    int    gpu_batch = 2048;
+    bool   gpu_batch_given = false;
     int    gpu_adapt = 0;       // VRAM tier: every this many generated tokens a layer may swap one slot; 0 = the slots stay as loaded
     float  adapt_margin = 1.5f; // ... if the expert coming in is asked for this many times as often as the one going out
     uint64_t swaps = 0;
+    double t_select = 0, t_aux = 0;     // seconds spent in the selection and in splitting it between the sides
     uint64_t transit_bytes = 0, transit_runs = 0;
     double   transit_s = 0;
     uint64_t pass_transit0 = 0;
@@ -255,7 +266,7 @@ struct la_state {
         if (const char * v = getenv("LA_DECAY"))          decay     = (float) atof(v);
         if (const char * v = getenv("LA_IO_THREADS"))     io_threads = std::max(1, atoi(v));
         if (const char * v = getenv("LA_AHEAD"))          ahead_k   = atoi(v);
-        if (const char * v = getenv("LA_GPU_BATCH"))      gpu_batch = atoi(v);
+        if (const char * v = getenv("LA_GPU_BATCH"))    { gpu_batch = atoi(v); gpu_batch_given = true; }
         if (const char * v = getenv("LA_GPU_ADAPT"))      gpu_adapt = atoi(v);
         if (const char * v = getenv("LA_GPU_ADAPT_MARGIN")) adapt_margin = (float) atof(v);
         if (const char * v = getenv("LA_READ_MB"))        read_span = (size_t) std::max(0.0, atof(v) * 1048576.0);
@@ -341,6 +352,7 @@ struct la_state {
                         "substituted/event=%.3f dropped/event=%.3f\n",
                 (unsigned long long) events, served/ev, reads/ev, exact_reads/ev, substituted/ev, dropped/ev);
         if (gpu_frac > 0) fprintf(stderr, "moe-la: gpu_served/event=%.3f\n", gpu_served/ev);
+        fprintf(stderr, "moe-la: %.2f s in the selection, %.2f s in splitting it between GPU and CPU\n", t_select, t_aux);
         if (gpu_adapt > 0) fprintf(stderr, "moe-la: %llu slot swaps\n", (unsigned long long) swaps);
         if (transit_runs > 0) fprintf(stderr, "moe-la: prompt batches sent %.2f GiB of experts to the GPU in %.2f s (%llu layer runs)\n",
                                       transit_bytes/gib, transit_s, (unsigned long long) transit_runs);
@@ -781,6 +793,7 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     la_state & s = state();
     std::lock_guard<std::mutex> lock(s.mtx);
     la_layer & L = s.get(layer, n_expert);
+    struct timer { double & acc; double t0; ~timer() { acc += now_s() - t0; } } timed{ s.t_select, now_s() };
 
     if (!s.real) {
         // no memory is at stake, so model generation: every token is its own run
@@ -971,6 +984,7 @@ void ggml_moe_la_gpu_cancel(int layer) {
 void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out) {
     la_state & s = state();
     const la_layer * L = (int) s.layers.size() > layer ? s.layers[layer].get() : nullptr;
+    struct timer { double & acc; double t0; ~timer() { acc += now_s() - t0; } } timed{ s.t_aux, now_s() };
     // kind 1: a selected expert that runs on the CPU still needs a slot id on the GPU side. It gets a
     // slot that no expert of this token uses, a different one each time, and the caller zeroes its
     // output with the kind 3 mask. The ids of one token must stay distinct: CUDA's kernel groups
@@ -1002,7 +1016,13 @@ void ggml_moe_la_aux(int layer, int kind, const int32_t * ids, int k, void * out
 
 int ggml_moe_la_gpu_batch_min(void) {
     const la_state & s = state();
-    return s.enabled && s.gpu_frac > 0 ? s.gpu_batch : 0;
+    return s.enabled && s.gpu_frac > 0 && s.real && s.gpu_batch_given ? s.gpu_batch : 0;
+}
+
+bool ggml_moe_la_batch_plain(int n_tokens) {
+    const la_state & s = state();
+    // a dropped expert is the id -1, which only the CPU kernels understand
+    return s.enabled && s.gpu_frac > 0 && !s.real && s.theta <= 0 && s.gpu_batch > 0 && n_tokens >= s.gpu_batch;
 }
 
 void ggml_moe_la_set_slots(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]) {

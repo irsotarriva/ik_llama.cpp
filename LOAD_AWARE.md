@@ -27,6 +27,13 @@ Reading a prompt (real mode, on by default):
 | `LA_AHEAD=-1` | while a layer computes a batch, the experts the next layer will probably ask for are read: its router is applied to this layer's input and the union of the first N guesses per token is fetched. -1 = as many as a token uses, 0 = off. More than that reads too much that is not used |
 | `LA_READ_MB=8` | neighbouring experts are read with one request of at most this size |
 
+VRAM tier:
+
+| variable | meaning |
+|---|---|
+| `LA_GPU_BATCH=2048` | prompt batches of this many tokens or more (0 = never). Without `LA_REAL` they skip the tier and take the engine's own GPU route for big batches, which copies the layer's experts to the card per batch: about twice as fast with a prompt in one batch, slower in batches of 1,024, so use `-b 4096 -ub 4096` or more on a GPU machine. With `LA_REAL` that route is closed (the experts are only partly in memory); giving the variable then sends the experts a batch needs through scratch tensors on the GPU, which was 19% slower than the CPU side in batches of 1,024 and 3 to 18% faster with one batch |
+| `LA_GPU_ADAPT=8` | off by default. Every N generated tokens a layer may give the slot of its least requested slot expert to its most requested expert without one (`LA_GPU_ADAPT_MARGIN`, 1.5: how many times as often). In real mode the two change places in memory, nothing is read from disk |
+
 Others, with their defaults: `LA_THETA` (0; drop weak experts, not useful on stock models),
 `LA_GAMMA` (0; multiplicative form of the bias), `LA_EVICT` (`freq`; `lru` for least recently used),
 `LA_DECAY` (decay of the request counts), `LA_PRICE_RESIDENT` (0.1), `LA_EXCESS_RAM` (0; extra price

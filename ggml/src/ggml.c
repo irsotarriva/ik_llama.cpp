@@ -10964,6 +10964,10 @@ struct ggml_tensor * ggml_moe_la_aux_op(
     return result;
 }
 
+bool ggml_moe_la_gpu_plain(int n_tokens) {
+    return ggml_moe_la_batch_plain(n_tokens);
+}
+
 int ggml_moe_la_gpu_batch(void) {
     return ggml_moe_la_gpu_batch_min();
 }
