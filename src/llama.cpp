@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "llama-la-rows.h"
 #include "llama-impl.h"
 #if defined(__linux__) || defined(__APPLE__)
+#include <atomic>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -424,6 +426,7 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    llama_la_rows::get().detach();
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -7127,6 +7130,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 hist.resize(pos + 1, eos);
             }
             hist[pos] = tok_of(i);
+        }
+
+        // the rows are known here, before any layer runs: have them in memory by then
+        if (lctx.model.tok_embd_per_layer && ggml_backend_buffer_is_host(lctx.model.tok_embd_per_layer->buffer)) {
+            llama_la_rows::get().touch(lctx.model.tok_embd_per_layer, data, (int64_t) n_tokens * n_heads, n_tokens);
         }
     }
 

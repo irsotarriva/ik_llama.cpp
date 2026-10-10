@@ -85,9 +85,13 @@ void ggml_moe_la_begin(int layer);
 void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int32_t * ids);
 void ggml_moe_la_end(int layer);
 
-bool ggml_moe_la_prefetching(void);
+// True if a graph for n_tokens tokens should carry the guess for the next layer.
+bool ggml_moe_la_prefetching(int n_tokens);
 // logits: the router of `layer` applied to the input of the layer before it (n_expert values)
 void ggml_moe_la_prefetch(int layer, const float * logits, int n_expert);
+// The same for n_rows tokens at once (rows row_bytes apart): one token is passed to
+// ggml_moe_la_prefetch, a batch has the union of its guesses read ahead in real mode.
+void ggml_moe_la_guess(int layer, const float * logits, int n_expert, int n_rows, size_t row_bytes);
 
 // VRAM tier. The engine keeps a copy of some experts of each layer in GPU slot
 // tensors and runs them there; the rest run on the CPU as usual.
