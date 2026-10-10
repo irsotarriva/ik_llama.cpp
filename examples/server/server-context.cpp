@@ -461,6 +461,14 @@ void server_context::init() {
         }
     }
 
+    {
+        // what a saved state depends on besides its tokens
+        std::error_code ec;
+        const auto model_bytes = std::filesystem::file_size(params_base.model, ec);
+        cache_store.init(std::filesystem::path(params_base.model).filename().string() + "|" + std::to_string(ec ? 0 : model_bytes) +
+                         "|" + params_base.cache_type_k + "|" + params_base.cache_type_v);
+    }
+
     if (!params_base.ctx_checkpoint_spill_dir.empty()) {
         // checkpoint spill: fresh session owns the dir; drop stale files
         // from crashed runs so orphans can never accumulate
@@ -1185,6 +1193,22 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     auto stream_opt = json_value(data, "stream_options", json::object());
     slot.params.include_usage = json_value(stream_opt, "include_usage", false);
     slot.params.cache_prompt = json_value(data, "cache_prompt", true);
+    slot.params.cache_breakpoints.clear();
+    slot.breakpoint_hit = -1;
+    if (data.contains("cache_breakpoints") && data.at("cache_breakpoints").is_array()) {
+        for (const auto & b : data.at("cache_breakpoints")) {
+            server_cache_breakpoint bp;
+            bp.n_tokens = b.is_object() ? json_value(b, "n_tokens", 0) : b.is_number_integer() ? b.get<int32_t>() : 0;
+            if (bp.n_tokens <= 0) {
+                continue;   // a position given in characters that did not fall on a token boundary
+            }
+            if (b.is_object()) {
+                bp.ttl_s   = b.contains("ttl") ? server_cache_parse_ttl(b.at("ttl")) : 0;
+                bp.persist = json_value(b, "persist", bp.ttl_s > 0) && bp.ttl_s > 0;
+            }
+            slot.params.cache_breakpoints.push_back(bp);
+        }
+    }
     slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", json_value(data, "max_completion_tokens", defaults.n_predict)));
     slot.saturate_predict = json_value(data, "saturate_predict", false);
     slot.sparams.top_k = json_value(data, "top_k", default_sparams.top_k);
@@ -3745,6 +3769,118 @@ static bool verify_restored_checkpoint(
     return true;
 }
 
+// the tokens as plain ids; false if the prompt holds anything that is not text
+static bool cache_text_tokens(const server_tokens & tokens, size_t n, std::vector<llama_token> & out) {
+    out.clear();
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            return false;
+        }
+        out.push_back(tokens[i]);
+    }
+    return true;
+}
+
+// The batch that was just decoded ended at a position the client marked. Take a checkpoint there,
+// and if the client asked for it write the state of the whole prefix to the store.
+void server_context::on_cache_breakpoint(server_slot & slot) {
+    const int idx = slot.breakpoint_hit;
+    slot.breakpoint_hit = -1;
+    if (idx < 0 || idx >= (int) slot.params.cache_breakpoints.size()) {
+        return;
+    }
+    const server_cache_breakpoint bp = slot.params.cache_breakpoints[idx];
+    create_checkpoint(slot);
+    auto & ckpts = slot.server_cached_prompt.checkpoints;
+    const bool have_ckpt = !ckpts.empty() && ckpts.back().n_tokens == slot.cache_tokens.n_tokens();
+    if (have_ckpt) {
+        ckpts.back().client = true;
+    }
+    if (!bp.persist || !cache_store.enabled()) {
+        return;
+    }
+    std::vector<llama_token> toks;
+    if (!system_tokens.empty() || slot.n_past != slot.n_past_prompt || slot.cache_tokens.n_tokens() != bp.n_tokens ||
+        !cache_text_tokens(slot.cache_tokens, slot.cache_tokens.size(), toks)) {
+        SLT_WRN(slot, "cache breakpoint at %d tokens is not kept on disk: the context was shifted or holds more than text\n", bp.n_tokens);
+        return;
+    }
+    server_cache_entry e;
+    e.id = cache_store.id_for(toks, e.hash);
+    if (cache_store.has(e.id)) {
+        cache_store.extend(e.id, bp.ttl_s, e);
+        return;
+    }
+    const int64_t t_start = ggml_time_us();
+    if (llama_state_seq_save_file(ctx, cache_store.path(e.id, ".state").c_str(), slot.id, toks.data(), toks.size()) == 0) {
+        SLT_ERR(slot, "cache breakpoint at %d tokens: could not write %s\n", bp.n_tokens, cache_store.path(e.id, ".state").c_str());
+        return;
+    }
+    save_server_tokens_to_file(cache_store.path(e.id, ".tokens.json"), slot.cache_tokens);
+    e.n_tokens = bp.n_tokens;
+    e.ttl_s    = bp.ttl_s;
+    cache_store.add(e);
+    SLT_WRN(slot, "cache breakpoint at %d tokens kept on disk as %s for %lld s (%.2f ms)\n", bp.n_tokens, e.id.c_str(),
+            (long long) bp.ttl_s, (ggml_time_us() - t_start) / 1000.0);
+}
+
+// Before a prompt is matched against what the slot holds: if the store has a state for a longer
+// start of the prompt than the slot can reuse, load it.
+void server_context::cache_store_restore(server_slot & slot, const server_tokens & prompt_tokens) {
+    if (!cache_store.enabled() || !system_tokens.empty() || prompt_tokens.size() < 2) {
+        return;
+    }
+    // an entry must be shorter than the prompt: at least one token has to be evaluated after it
+    std::vector<llama_token> toks;
+    if (!cache_text_tokens(prompt_tokens, prompt_tokens.size() - 1, toks)) {
+        return;
+    }
+    server_cache_entry e;
+    if (!cache_store.find(toks, e)) {
+        return;
+    }
+    // what the slot can reuse by itself
+    const int32_t lcp = (int32_t) slot.cache_tokens.get_common_prefix(ctx, prompt_tokens).first;
+    int32_t usable = lcp;
+    if (lcp < (int32_t) slot.cache_tokens.size() && !llama_model_supports_partial_kv_reuse(model)) {
+        usable = 0;
+        for (const auto & c : slot.server_cached_prompt.checkpoints) {
+            if (c.n_tokens <= lcp) {
+                usable = std::max(usable, (int32_t) c.n_tokens);
+            }
+        }
+    }
+    if (e.n_tokens <= usable) {
+        return;
+    }
+    const int64_t t_start = ggml_time_us();
+    clear_checkpoints_and_spill(slot.server_cached_prompt.checkpoints);
+    slot.checkpoint_pos = -1;
+    slot.cache_tokens.resize(slot.n_ctx);
+    size_t token_count = 0;
+    const size_t nread = llama_state_seq_load_file(ctx, cache_store.path(e.id, ".state").c_str(), slot.id,
+                                                   slot.cache_tokens.data(), slot.cache_tokens.size(), &token_count);
+    if (nread == 0 || (int32_t) token_count != e.n_tokens) {
+        SLT_ERR(slot, "prompt cache store: %s could not be loaded, dropping it\n", e.id.c_str());
+        common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
+        slot.cache_tokens.clear();
+        cache_store.remove(e.id);
+        return;
+    }
+    load_server_tokens_from_file(cache_store.path(e.id, ".tokens.json"), slot.cache_tokens);
+    // A model that cannot step back without a checkpoint needs one here to branch off at this position
+    // later. It is made from the state just loaded: a copy in the store would double the entry.
+    if (create_checkpoint(slot)) {
+        slot.server_cached_prompt.checkpoints.back().client = true;
+        slot.checkpoint_pos = slot.server_cached_prompt.checkpoints.back().pos_max;
+    }
+    slot.n_discarded_prompt = 0;
+    slot.n_kept_prompt = 0;
+    SLT_WRN(slot, "prompt cache store: loaded %s, %d tokens, %.1f MiB in %.2f ms (the slot could reuse %d)\n", e.id.c_str(), e.n_tokens,
+            nread / 1048576.0, (ggml_time_us() - t_start) / 1000.0, usable);
+}
+
 void server_context::create_checkpoint_at_interval(server_slot & slot) {
     if (!this->params_base.do_checkpoint) {
         return;
@@ -3920,7 +4056,7 @@ static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_varianc
 static std::list<server_prompt_checkpoint>::iterator skip_prompt_end(
         std::list<server_prompt_checkpoint> & ckpts,
         std::list<server_prompt_checkpoint>::iterator it) {
-    if (it->prompt_end && std::next(it) != ckpts.end()) {
+    if ((it->prompt_end || it->client) && std::next(it) != ckpts.end()) {
         ++it;
     }
     return it;
@@ -4160,6 +4296,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         else {
                             GGML_ASSERT(slot.ga_n == 1);
 
+                            // a state a client asked to keep may cover more of the prompt than this slot holds
+                            cache_store_restore(slot, prompt_tokens);
                             // reuse any previously computed tokens that are common with the new prompt
                             common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
                             LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
@@ -4243,6 +4381,14 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past = 0;
                 }
                 slot.cache_tokens.keep_first(slot.n_past);
+                {
+                    // Whatever put the kept tokens into the context (this slot, a checkpoint, the prompt cache, a
+                    // state from the disk), the engine needs to know which tokens they are to continue after them.
+                    std::vector<llama_token> kept;
+                    if (system_tokens.empty() && cache_text_tokens(slot.cache_tokens, slot.cache_tokens.size(), kept)) {
+                        llama_kv_cache_seq_set_tokens(ctx, slot.id, kept.data(), kept.size());
+                    }
+                }
                 int p0 = (int)system_tokens.size() + slot.n_past;
                 p0 = system_tokens.size() + slot.cache_tokens.pos_next();
                 const bool trimmed = common_speculative_trim_sequence(slot.spec, ctx, slot.id, p0);
@@ -4350,6 +4496,17 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     if (params_base.do_checkpoint && slot.n_prompt_tokens - slot.n_past_prompt == params_base.ctx_checkpoints_tolerance) {
                         slot.do_checkpoint = true;
                         break;
+                    }
+                    // a position the client marked: the batch ends here, so the state after it is exactly this prefix
+                    if (slot.n_past_prompt < slot.n_prompt_tokens) {
+                        for (size_t ib = 0; ib < slot.params.cache_breakpoints.size(); ++ib) {
+                            if (slot.params.cache_breakpoints[ib].n_tokens == slot.n_past_prompt) {
+                                slot.breakpoint_hit = (int) ib;
+                            }
+                        }
+                        if (slot.breakpoint_hit >= 0) {
+                            break;
+                        }
                     }
 
                 }
@@ -4959,7 +5116,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (!is_active_slot || slot.i_batch < (int)i || slot.i_batch >= (int)(i + n_tokens)) {
                 // save checkpoint during prompt processing
                 if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
-                    if (slot.do_checkpoint) {
+                    if (slot.breakpoint_hit >= 0) {
+                        on_cache_breakpoint(slot);
+                    } else if (slot.do_checkpoint) {
                         create_checkpoint(slot, true);
                     } else {
                         create_checkpoint_at_interval(slot);

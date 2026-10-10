@@ -1040,6 +1040,11 @@ extern "C" {
         "use llama_state_save_file instead");
 
     // Get the exact size needed to copy the KV cache of a single sequence
+    // The tokens of a sequence, position by position. Models that look tokens up by the n-gram they end
+    // (per-layer token embeddings) need the tokens before a position to continue after it, and a saved
+    // state does not hold them: call this after restoring a sequence, before decoding more of it.
+    LLAMA_API void llama_kv_cache_seq_set_tokens(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_tokens);
+
     LLAMA_API size_t llama_state_seq_get_size(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
