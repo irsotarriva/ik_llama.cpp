@@ -234,13 +234,15 @@ struct server_cache_store {
     }
 
     // id of the entry for these tokens (it need not exist)
-    std::string id_for(const std::vector<llama_token> & tokens, uint64_t & hash) const {
+    // kind: empty for the state of a prompt, "tab" for a tab. It is part of the id and of the entry's
+    // model key, so a tab is never loaded as the start of a prompt with the same tokens.
+    std::string id_for(const std::vector<llama_token> & tokens, uint64_t & hash, const std::string & kind = "") const {
         hash = HASH_START;
         for (llama_token t : tokens) {
             hash = hash_step(hash, t);
         }
         uint64_t k = hash;
-        for (char c : model_key) {
+        for (char c : model_key + kind) {
             k ^= (uint8_t) c;
             k *= 1099511628211ull;
         }
@@ -254,10 +256,26 @@ struct server_cache_store {
         return entries.count(id) > 0;
     }
 
-    // the files of a new entry are written; record it
-    void add(server_cache_entry e) {
+    // the entry with this id, if it is of this model and kind. Using it starts its time again.
+    bool lookup(const std::string & id, const std::string & kind, server_cache_entry & out) {
         std::lock_guard<std::mutex> lock(mtx);
-        e.model   = model_key;
+        if (!enabled()) {
+            return false;
+        }
+        purge_locked();
+        auto it = entries.find(id);
+        if (it == entries.end() || it->second.model != model_key + kind) {
+            return false;
+        }
+        touch_locked(it->second);
+        out = it->second;
+        return true;
+    }
+
+    // the files of a new entry are written; record it
+    void add(server_cache_entry e, const std::string & kind = "") {
+        std::lock_guard<std::mutex> lock(mtx);
+        e.model   = model_key + kind;
         e.created = e.last_used = now();
         e.expires = e.created + e.ttl_s;
         e.bytes   = 0;
@@ -306,7 +324,8 @@ struct server_cache_store {
         for (const auto & kv : entries) {
             json j = kv.second.to_json();
             j["expires_in"] = kv.second.expires - t;
-            j["usable"]     = kv.second.model == model_key;
+            j["usable"]     = kv.second.model == model_key || kv.second.model == model_key + "|tab";
+            j["kind"]       = kv.second.model.size() > 4 && kv.second.model.compare(kv.second.model.size() - 4, 4, "|tab") == 0 ? "tab" : "prompt";
             out.push_back(j);
         }
         return json{ {"enabled", enabled()}, {"dir", dir}, {"limit_bytes", max_bytes}, {"entries", out} };

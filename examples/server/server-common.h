@@ -522,6 +522,9 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  */
 void resolve_cache_breakpoints(const llama_vocab * vocab, json & data, const json & prompt, const server_tokens & tokens);
 
+// "tabs": [{"name": ..., "content": text or tokens, "ttl": ...}] -> every tab gets "tokens"
+void resolve_tabs(const llama_vocab * vocab, json & data);
+
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special);
 
 // Assuming raw_buffer has .data() and .size() members

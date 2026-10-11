@@ -17,6 +17,13 @@ json result_timings::to_json() const {
         {"n_past",           n_past},
     };
 
+    if (tabs_open >= 0) {
+        base["tabs"] = {
+            {"open", tabs_open}, {"reused", tabs_reused}, {"loaded", tabs_loaded}, {"encoded", tabs_encoded},
+            {"tokens_encoded", tab_tokens_encoded}, {"ms", tabs_ms},
+        };
+    }
+
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;

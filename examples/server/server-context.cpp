@@ -238,6 +238,10 @@ server_context::~server_context() {
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 
+    if (const char * e = getenv("LA_TABS"); e && atoi(e) > 0) {
+        params_base.n_tabs = atoi(e);       // sequences for tabs, beside the slots'
+    }
+
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
     model = llama_init.model;
@@ -250,6 +254,25 @@ bool server_context::load_model(const gpt_params& params_) {
     }
 
     n_ctx = llama_n_ctx(ctx);
+
+    if (params_base.n_tabs > 0 && !llama_model_has_tabs(model)) {
+        LOG_WARNING("LA_TABS is set but this model has no tab support; ignored", {});
+    } else if (params_base.n_tabs > 0) {
+        // the tabs' cells come out of the context; the slots share what is left
+        const char * e = getenv("LA_TAB_CTX");
+        n_tabs_max = params_base.n_tabs;
+        n_tab_ctx  = std::min(e && atoi(e) > 0 ? atoi(e) : n_ctx / 2, n_ctx - 64 * params_base.n_parallel);
+        if (n_tab_ctx <= 0) {
+            LOG_WARNING("the context is too small to set cells aside for tabs; tabs are off", {});
+            n_tabs_max = n_tab_ctx = 0;
+        } else {
+            n_ctx -= n_tab_ctx;
+            for (int i = 0; i < n_tabs_max; ++i) {
+                tab_seq_free.push_back(params_base.n_parallel + n_tabs_max - 1 - i);
+            }
+            LLAMA_LOG_INFO("tabs: up to %d, %d cells of the context set aside for them, %d left for the slots\n", n_tabs_max, n_tab_ctx, n_ctx);
+        }
+    }
 
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
@@ -346,6 +369,10 @@ void server_context::init() {
         slot.id = i;
         slot.ctx = ctx;
         slot.n_ctx = n_ctx_slot;
+        if (llama_model_has_tabs(model)) {
+            // the slot's sequence is an agent stream: the model's position offset, and tabs can be attached
+            llama_tab_set_agent(ctx, slot.id, true);
+        }
         slot.n_predict = params_base.n_predict;
         slot.mctx = mctx;
         slot.cache_tokens.has_mtmd = mctx != nullptr;
@@ -724,6 +751,9 @@ json server_slot::get_formatted_timings() const {
         {"n_ctx",           n_ctx},
         {"n_past",           n_past},
     };
+    if (tabs_open >= 0) {
+        timings["tabs"] = get_timings().to_json().at("tabs");
+    }
     if (n_draft_total > 0) {
         timings["draft_n"]          = n_draft_total;
         timings["draft_n_accepted"] = n_draft_accepted;
@@ -761,6 +791,13 @@ result_timings server_slot::get_timings() const {
 
     timings.n_ctx = n_ctx;
     timings.n_past = n_past;
+
+    timings.tabs_open          = tabs_open;
+    timings.tabs_reused        = tabs_reused;
+    timings.tabs_loaded        = tabs_loaded;
+    timings.tabs_encoded       = tabs_encoded;
+    timings.tab_tokens_encoded = tab_tokens_encoded;
+    timings.tabs_ms            = tabs_ms;
 
 
     // Add speculative metrics
@@ -1195,6 +1232,19 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     slot.params.cache_prompt = json_value(data, "cache_prompt", true);
     slot.params.cache_breakpoints.clear();
     slot.breakpoint_hit = -1;
+    slot.params.tabs.clear();
+    if (data.contains("tabs") && data.at("tabs").is_array()) {
+        for (const auto & t : data.at("tabs")) {
+            if (!t.is_object() || !t.contains("tokens") || !t.at("tokens").is_array()) {
+                continue;
+            }
+            server_tab_request tab;
+            tab.name   = json_value(t, "name", std::string());
+            tab.tokens = t.at("tokens").get<std::vector<llama_token>>();
+            tab.ttl_s  = t.contains("ttl") ? server_cache_parse_ttl(t.at("ttl")) : 0;
+            slot.params.tabs.push_back(std::move(tab));
+        }
+    }
     if (data.contains("cache_breakpoints") && data.at("cache_breakpoints").is_array()) {
         for (const auto & b : data.at("cache_breakpoints")) {
             server_cache_breakpoint bp;
@@ -2110,6 +2160,7 @@ void server_context::kv_cache_clear() {
 
     // clear the entire KV cache
     llama_kv_cache_clear(ctx);
+    tabs_reset();
     for (auto & slot : slots) {
         if (slot.spec == nullptr) {
             continue;
@@ -3827,6 +3878,231 @@ void server_context::on_cache_breakpoint(server_slot & slot) {
 
 // Before a prompt is matched against what the slot holds: if the store has a state for a longer
 // start of the prompt than the slot can reuse, load it.
+// the cache was cleared: no tab has cells any more
+void server_context::tabs_reset() {
+    std::lock_guard<std::mutex> lock(tabs_mtx);
+    for (auto & kv : tabs) {
+        tab_seq_free.push_back(kv.second.seq);
+    }
+    tabs.clear();
+    n_tab_cells = 0;
+    for (auto & slot : slots) {
+        slot.tab_ids.clear();
+        if (ctx && llama_model_has_tabs(model)) {
+            llama_tab_detach(ctx, slot.id, -1);
+        }
+    }
+}
+
+json server_context::tabs_list() {
+    std::lock_guard<std::mutex> lock(tabs_mtx);
+    json out = json::array();
+    for (const auto & kv : tabs) {
+        out.push_back({
+            {"id", kv.first}, {"name", kv.second.name}, {"n_tokens", kv.second.tokens.size()}, {"seq", kv.second.seq},
+            {"slots", kv.second.slots}, {"last_used", kv.second.last_used}, {"n_uses", kv.second.n_uses}, {"on_disk", kv.second.on_disk},
+        });
+    }
+    return json{
+        {"supported", model != nullptr && llama_model_has_tabs(model)}, {"max_tabs", n_tabs_max},
+        {"cells", n_tab_ctx}, {"cells_used", n_tab_cells}, {"tabs", out},
+    };
+}
+
+// Makes the tabs of the slot's request the ones its sequence reads. A tab is looked for by its
+// tokens: in memory, then in the store on disk, and encoded if it is in neither. Tabs the slot had
+// and the request does not name are detached and stay in memory until their cells are needed.
+bool server_context::sync_tabs(server_slot & slot, std::string & error) {
+    const auto & want = slot.params.tabs;
+    slot.tabs_open = -1;
+    slot.tabs_reused = slot.tabs_loaded = slot.tabs_encoded = slot.tab_tokens_encoded = 0;
+    slot.tabs_ms = 0;
+    if (!llama_model_has_tabs(model)) {
+        if (!want.empty()) {
+            error = "this model has no tab support";
+            return false;
+        }
+        return true;
+    }
+    if (!want.empty() && n_tabs_max == 0) {
+        error = "tabs are off: start the server with LA_TABS=N (the most tabs kept at a time)";
+        return false;
+    }
+    if (n_tabs_max == 0) {
+        return true;
+    }
+    const int64_t t_start = ggml_time_us();
+    const int64_t now = server_cache_store::now();
+    const std::string kind = "|tab";
+    std::lock_guard<std::mutex> lock(tabs_mtx);
+
+    // what the request wants, by content
+    std::vector<std::string> ids;
+    std::vector<const server_tab_request *> reqs;
+    int32_t n_new_cells = 0;
+    for (const auto & t : want) {
+        if (t.tokens.empty()) {
+            continue;
+        }
+        uint64_t hash = 0;
+        const std::string id = cache_store.id_for(t.tokens, hash, kind);
+        if (std::find(ids.begin(), ids.end(), id) != ids.end()) {
+            continue;
+        }
+        ids.push_back(id);
+        reqs.push_back(&t);
+    }
+    if ((int32_t) ids.size() > n_tabs_max) {
+        error = "the request has " + std::to_string(ids.size()) + " tabs, the server keeps at most " + std::to_string(n_tabs_max) + " (LA_TABS)";
+        return false;
+    }
+
+    // detach what the slot had and no longer wants
+    for (const auto & id : slot.tab_ids) {
+        auto it = tabs.find(id);
+        if (it == tabs.end() || std::find(ids.begin(), ids.end(), id) != ids.end()) {
+            continue;
+        }
+        it->second.slots.erase(slot.id);
+        llama_tab_detach(ctx, slot.id, it->second.seq);
+    }
+    slot.tab_ids.clear();
+
+    // hold on to the ones that are there, so that making room does not take them
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto it = tabs.find(ids[i]);
+        if (it != tabs.end()) {
+            it->second.slots.insert(slot.id);
+        } else {
+            n_new_cells += (int32_t) reqs[i]->tokens.size();
+        }
+    }
+
+    auto fail = [&](const std::string & msg) {
+        // leave the slot with the tabs that are attached so far
+        for (const auto & id : ids) {
+            auto it = tabs.find(id);
+            if (it != tabs.end() && it->second.slots.count(slot.id)) {
+                llama_tab_attach(ctx, slot.id, it->second.seq);
+                slot.tab_ids.push_back(id);
+            }
+        }
+        error = msg;
+        return false;
+    };
+
+    const int32_t n_batch = llama_n_batch(ctx);
+    llama_batch tab_batch = llama_batch_init(n_batch, 0, 1);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto it = tabs.find(ids[i]);
+        if (it != tabs.end()) {
+            slot.tabs_reused++;
+        } else {
+            const auto & req = *reqs[i];
+            const int32_t n = (int32_t) req.tokens.size();
+            // room: a free sequence and free cells, taken from the tabs nobody has open, oldest first
+            while (tab_seq_free.empty() || n_tab_cells + n > n_tab_ctx) {
+                auto oldest = tabs.end();
+                for (auto t = tabs.begin(); t != tabs.end(); ++t) {
+                    if (t->second.slots.empty() && (oldest == tabs.end() || t->second.last_used < oldest->second.last_used)) {
+                        oldest = t;
+                    }
+                }
+                if (oldest == tabs.end()) {
+                    llama_batch_free(tab_batch);
+                    return fail("no room for the tabs: " + std::to_string(n_tab_cells) + " of " + std::to_string(n_tab_ctx) +
+                                " cells are held by open tabs and the new ones need " + std::to_string(n_new_cells) + " (LA_TAB_CTX, LA_TABS)");
+                }
+                llama_kv_cache_seq_rm(ctx, oldest->second.seq, -1, -1);
+                n_tab_cells -= (int32_t) oldest->second.tokens.size();
+                tab_seq_free.push_back(oldest->second.seq);
+                tabs.erase(oldest);
+            }
+            server_tab tab;
+            tab.name   = req.name;
+            tab.tokens = req.tokens;
+            tab.seq    = tab_seq_free.back();
+            tab_seq_free.pop_back();
+            llama_kv_cache_seq_rm(ctx, tab.seq, -1, -1);
+
+            // on disk?
+            server_cache_entry e;
+            bool loaded = false;
+            if (cache_store.lookup(ids[i], kind, e)) {
+                std::vector<llama_token> toks(n + 1);
+                size_t n_toks = 0;
+                const size_t nread = llama_state_seq_load_file(ctx, cache_store.path(e.id, ".state").c_str(), tab.seq,
+                                                               toks.data(), toks.size(), &n_toks);
+                toks.resize(std::min(n_toks, toks.size()));
+                loaded = nread > 0 && toks == req.tokens;
+                if (!loaded) {
+                    llama_kv_cache_seq_rm(ctx, tab.seq, -1, -1);
+                    cache_store.remove(e.id);
+                }
+                tab.on_disk = loaded;
+            }
+            if (loaded) {
+                slot.tabs_loaded++;
+            } else {
+                // a tab is a sequence of its own, positions from 0, no logits
+                for (int32_t p = 0; p < n; ) {
+                    common_batch_clear(tab_batch);
+                    for (; p < n && tab_batch.n_tokens < n_batch; ++p) {
+                        common_batch_add(tab_batch, req.tokens[p], p, { tab.seq }, false);
+                    }
+                    if (llama_decode(ctx, tab_batch) != 0) {
+                        llama_kv_cache_seq_rm(ctx, tab.seq, -1, -1);
+                        tab_seq_free.push_back(tab.seq);
+                        llama_batch_free(tab_batch);
+                        return fail("could not encode tab '" + req.name + "' (" + std::to_string(n) + " tokens)");
+                    }
+                }
+                slot.tabs_encoded++;
+                slot.tab_tokens_encoded += n;
+            }
+            n_tab_cells += n;
+            tab.slots.insert(slot.id);
+            it = tabs.emplace(ids[i], std::move(tab)).first;
+        }
+
+        server_tab & tab = it->second;
+        tab.last_used = now;
+        tab.n_uses++;
+        if (!reqs[i]->name.empty()) {
+            tab.name = reqs[i]->name;
+        }
+        // the client wants it kept on disk
+        if (reqs[i]->ttl_s > 0 && cache_store.enabled()) {
+            server_cache_entry e;
+            if (tab.on_disk && cache_store.extend(ids[i], reqs[i]->ttl_s, e)) {
+                // its time starts again
+            } else if (llama_state_seq_save_file(ctx, cache_store.path(ids[i], ".state").c_str(), tab.seq,
+                                                 tab.tokens.data(), tab.tokens.size()) > 0) {
+                e = server_cache_entry();
+                e.id       = ids[i];
+                e.n_tokens = (int32_t) tab.tokens.size();
+                e.ttl_s    = reqs[i]->ttl_s;
+                uint64_t hash = 0;
+                cache_store.id_for(tab.tokens, hash, kind);
+                e.hash     = hash;
+                cache_store.add(e, kind);
+                tab.on_disk = true;
+            }
+        }
+        llama_tab_attach(ctx, slot.id, tab.seq);
+        slot.tab_ids.push_back(ids[i]);
+    }
+    llama_batch_free(tab_batch);
+
+    slot.tabs_open = (int32_t) slot.tab_ids.size();
+    slot.tabs_ms   = (ggml_time_us() - t_start) / 1e3;
+    if (slot.tabs_open > 0 || slot.tabs_encoded > 0) {
+        SLT_INF(slot, "tabs: %d open (%d in memory, %d from disk, %d encoded: %d tokens) in %.1f ms\n",
+                slot.tabs_open, slot.tabs_reused, slot.tabs_loaded, slot.tabs_encoded, slot.tab_tokens_encoded, slot.tabs_ms);
+    }
+    return true;
+}
+
 void server_context::cache_store_restore(server_slot & slot, const server_tokens & prompt_tokens) {
     if (!cache_store.enabled() || !system_tokens.empty() || prompt_tokens.size() < 2) {
         return;
@@ -4235,6 +4511,19 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         slot.release();
                         slot.print_timings();
                         continue;
+                    }
+
+                    // the tabs the request has open: the new ones are encoded, the others detached.
+                    // What the slot already holds of the prompt does not depend on them.
+                    {
+                        std::string tab_error;
+                        if (!sync_tabs(slot, tab_error)) {
+                            slot.state = SLOT_STATE_PROCESSING;
+                            slot.command = SLOT_COMMAND_NONE;
+                            slot.release();
+                            send_error(slot, tab_error, ERROR_TYPE_INVALID_REQUEST);
+                            continue;
+                        }
                     }
 
                     if (slot.embedding) {

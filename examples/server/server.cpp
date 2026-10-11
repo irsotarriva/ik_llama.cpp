@@ -1160,6 +1160,7 @@ int main(int argc, char ** argv) {
                     json prompt_copy = prompt;      // `prompt` refers into `data`, which is changed here
                     resolve_cache_breakpoints(llama_get_vocab(ctx_server.ctx), data, prompt_copy, inputs[0]);
                 }
+                resolve_tabs(llama_get_vocab(ctx_server.ctx), data);
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
@@ -2184,6 +2185,10 @@ int main(int argc, char ** argv) {
     svr->Post("/embeddings",          handle_embeddings);
     svr->Post("/v1/embeddings",       handle_embeddings_oai);
     svr->Post("/tokenize",            handle_tokenize);
+    // the tabs in memory (README-tabs.md)
+    svr->Get ("/tabs", [&ctx_server](const httplib::Request &, httplib::Response & res) {
+        res.set_content(ctx_server.tabs_list().dump(), "application/json; charset=utf-8");
+    });
     // states the clients asked to keep on disk (README-cache.md): list, extend, delete
     svr->Get ("/cache", [&ctx_server](const httplib::Request &, httplib::Response & res) {
         res.set_content(ctx_server.cache_store.list().dump(), "application/json; charset=utf-8");

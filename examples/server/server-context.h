@@ -122,6 +122,11 @@ struct server_slot {
     llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
     int  breakpoint_hit = -1;       // index into params.cache_breakpoints of the one the batch being decoded ends at
+
+    // tabs attached to this slot's sequence (ids in server_context::tabs), and what the last request did
+    std::vector<std::string> tab_ids;
+    int32_t tabs_open = -1, tabs_reused = 0, tabs_loaded = 0, tabs_encoded = 0, tab_tokens_encoded = 0;
+    double  tabs_ms = 0;
     bool image_just_processed = false;
 
     // sampling
@@ -276,6 +281,28 @@ struct server_context {
     server_cache_store cache_store;     // states the clients asked to keep on disk
     void on_cache_breakpoint(server_slot & slot);
     void cache_store_restore(server_slot & slot, const server_tokens & prompt_tokens);
+
+    // Tabs (README-tabs.md): pieces of context encoded apart from any prompt, each a sequence of its
+    // own that the slots attach to. Kept by content, so two slots with the same tab share it and a tab
+    // that is closed and opened again is still there until its cells are needed.
+    struct server_tab {
+        std::string  name;
+        llama_seq_id seq = -1;
+        std::vector<llama_token> tokens;
+        std::set<int> slots;            // the slots it is attached to
+        int64_t last_used = 0;
+        int64_t n_uses    = 0;
+        bool    on_disk   = false;
+    };
+    int32_t n_tabs_max = 0;             // LA_TABS: tab sequences beside the slots'
+    int32_t n_tab_ctx  = 0;             // LA_TAB_CTX: cells of the context set aside for them
+    int32_t n_tab_cells = 0;            // ... in use
+    std::map<std::string, server_tab> tabs;
+    std::vector<llama_seq_id> tab_seq_free;
+    std::mutex tabs_mtx;
+    bool sync_tabs(server_slot & slot, std::string & error);
+    void tabs_reset();
+    json tabs_list();
 
     server_metrics metrics;
 

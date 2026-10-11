@@ -4533,7 +4533,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.n_v_first       = params.n_v_first;
     mparams.n_v_last        = params.n_v_last;
     mparams.max_ctx_size    = params.n_ctx;
-    mparams.n_seq_max       = params.n_parallel;
+    mparams.n_seq_max       = params.n_parallel + params.n_tabs;
     mparams.n_ubatch        = get_batch_ubatch(params).second;
     mparams.amb             = params.attn_max_batch;
     mparams.split_mode      = params.split_mode;
@@ -4597,7 +4597,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     auto [n_batch, n_ubatch] = get_batch_ubatch(params);
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_max         = params.n_parallel + params.n_tabs;
     cparams.n_batch           = n_batch;
     cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;

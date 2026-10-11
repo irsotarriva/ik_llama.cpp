@@ -321,6 +321,7 @@ struct gpt_params {
     int32_t n_keep                =       0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =      -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =       1; // number of parallel sequences to decode
+    int32_t n_tabs                =       0; // tab sequences beside the parallel ones (split tab models, server: LA_TABS)
     int32_t n_sequences           =       1; // number of sequences to decode
     float   p_split               =    0.1f; // speculative decoding split probability
     int32_t n_gpu_layers          =      -1; // number of layers to store in VRAM (-1 - use default)

@@ -904,6 +904,9 @@ json oaicompat_chat_params_parse(
     if (!cache_breakpoints.empty()) {
         llama_params["cache_breakpoints"] = cache_breakpoints;
     }
+    if (body.contains("tabs")) {
+        llama_params["tabs"] = body.at("tabs");
+    }
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {
@@ -1998,6 +2001,20 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  */
 // Cache breakpoints given as a number of characters of the prompt become a number of tokens. One that
 // does not fall between two tokens of the prompt is left without "n_tokens" and is ignored later.
+void resolve_tabs(const llama_vocab * vocab, json & data) {
+    if (!data.contains("tabs") || !data.at("tabs").is_array()) {
+        return;
+    }
+    for (auto & tab : data.at("tabs")) {
+        if (!tab.is_object() || tab.contains("tokens") || !tab.contains("content")) {
+            continue;
+        }
+        // text, tokens, or a mix of both; no BOS: a tab says itself how it starts
+        tab["tokens"] = tokenize_mixed(vocab, tab.at("content"), false, true);
+        tab.erase("content");
+    }
+}
+
 void resolve_cache_breakpoints(const llama_vocab * vocab, json & data, const json & prompt, const server_tokens & tokens) {
     if (!data.contains("cache_breakpoints") || !data.at("cache_breakpoints").is_array() || !prompt.is_string()) {
         return;

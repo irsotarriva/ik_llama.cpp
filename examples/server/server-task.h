@@ -55,8 +55,16 @@ struct server_cache_breakpoint {
     int64_t ttl_s    = 0;       // ... for this long after its last use
 };
 
+// A tab the request has open ("tabs"): a piece of context that is encoded apart from the prompt.
+struct server_tab_request {
+    std::string name;                   // the client's label, reported back, not part of the key
+    std::vector<llama_token> tokens;
+    int64_t ttl_s = 0;                  // > 0: also keep its state on disk for this long after its last use
+};
+
 struct slot_params {
     std::vector<server_cache_breakpoint> cache_breakpoints;
+    std::vector<server_tab_request> tabs;
     bool stream = true;
     bool include_usage = false;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt
@@ -142,6 +150,14 @@ struct result_timings {
     int32_t draft_n_accepted = 0;
     std::vector<int32_t> draft_n_by_depth;
     std::vector<int32_t> draft_n_accepted_by_depth;
+
+    // tabs of the request (-1: the request had none and the model has no tabs)
+    int32_t tabs_open = -1;         // attached for this request
+    int32_t tabs_reused = 0;        // ... of which already in memory
+    int32_t tabs_loaded = 0;        // ... read from the store on disk
+    int32_t tabs_encoded = 0;       // ... computed
+    int32_t tab_tokens_encoded = 0;
+    double  tabs_ms = 0;
 
     json to_json() const;
 };
