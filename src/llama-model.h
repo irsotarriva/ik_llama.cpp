@@ -568,6 +568,13 @@ struct llama_model {
     struct ggml_tensor * output_b;
     struct ggml_tensor * output_norm_enc;
     struct ggml_tensor * output_mtp = nullptr;
+
+    // split tab model: embedding width to model width and back, and the K/V every decoder layer reads
+    struct ggml_tensor * tab_embd_up   = nullptr;
+    struct ggml_tensor * tab_embd_down = nullptr;
+    struct ggml_tensor * tab_kv_norm   = nullptr;
+    struct ggml_tensor * tab_k         = nullptr;
+    struct ggml_tensor * tab_v         = nullptr;
     struct ggml_tensor * hc_head_base = nullptr;
     struct ggml_tensor * hc_head_fn = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;

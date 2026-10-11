@@ -109,6 +109,9 @@ void llm_build_context::init() {
         lctx.inp_KQ_mask     = nullptr;
         lctx.inp_KQ_mask_swa = nullptr;
         lctx.inp_KQ_mask_swa_win = nullptr;
+        lctx.inp_tab_mask_enc = nullptr;
+        lctx.inp_tab_mask_dec = nullptr;
+        lctx.inp_tab_pos_out  = nullptr;
         lctx.swa_window_view = {};
         lctx.inp_K_shift     = nullptr;
         lctx.inp_mean        = nullptr;
@@ -2969,6 +2972,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_QWEN3MOE:
             {
                 result = llm.build_qwen3moe();
+            } break;
+        case LLM_ARCH_TABSPLIT:
+            {
+                result = llm.build_tabsplit();
             } break;
         case LLM_ARCH_MELLUM:
             {

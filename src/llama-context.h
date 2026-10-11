@@ -654,6 +654,14 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa_win = nullptr; // F32 [SWA W_view, n_batch]
+    struct ggml_tensor * inp_tab_mask_enc = nullptr; // split tab model, [kv_size, n_batch]: a token sees the earlier cells of its sequence
+    struct ggml_tensor * inp_tab_mask_dec = nullptr; // split tab model, [kv_size, n_outputs]: the same, and for an agent token every cell of the tabs attached to its sequence
+    struct ggml_tensor * inp_tab_pos_out  = nullptr; // split tab model, I32 [n_outputs]: positions of the tokens the decoder runs on
+
+    // split tab model, per sequence: whether it is an agent stream, and the tab sequences it reads in the decoder
+    std::vector<uint8_t> tab_agent;
+    std::vector<std::vector<llama_seq_id>> tab_view;
+    bool tab_is_agent(llama_seq_id s) const { return s >= 0 && (size_t) s < tab_agent.size() && tab_agent[s]; }
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;         // I32 [n_batch]

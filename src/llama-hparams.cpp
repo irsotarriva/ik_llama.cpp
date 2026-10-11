@@ -633,6 +633,19 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_TABSPLIT:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_TAB_ENCODER_BLOCK_COUNT,     hparams.n_tab_split);
+                ml.get_key(LLM_KV_TAB_AGENT_POSITION,          hparams.n_tab_agent_pos, false);
+                if (hparams.n_tab_split < 1 || hparams.n_tab_split >= hparams.n_layer) {
+                    throw std::runtime_error("tabsplit: the encoder must have at least one layer and leave one for the decoder");
+                }
+                // layers 0 .. n_tab_split-1 keep their own K/V, slot n_tab_split holds the shared K/V
+                hparams.n_layer_kv_from_start = hparams.n_tab_split + 1;
+                model.type = e_model::MODEL_UNKNOWN;
+            } break;
         case LLM_ARCH_MELLUM:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);

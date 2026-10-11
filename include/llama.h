@@ -932,6 +932,26 @@ extern "C" {
     // cells of each tab also belong to the agent's sequence (examples/tab-test).
     LLAMA_API int32_t llama_kv_cache_seq_rm_cells(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Tabbed context, for models of the split tab architecture (llama_model_has_tabs).
+    //
+    // A tab is a sequence of its own, decoded with positions from 0. What it leaves in the cache
+    // depends on its own tokens only. An agent sequence reads the tabs attached to it: every token
+    // of each, whatever the order they were decoded or attached in. Attaching and detaching change
+    // what the tokens decoded from then on see, and nothing that is in the cache. A tab is closed by
+    // detaching it and removing its sequence (llama_kv_cache_seq_rm(ctx, tab, -1, -1)).
+    //
+    // The positions of an agent sequence are given from 0 like those of any sequence; the offset the
+    // model was trained with for the agent stream (llama_model_tab_agent_pos) is added inside.
+    LLAMA_API bool    llama_model_has_tabs(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_tab_agent_pos(const struct llama_model * model);
+
+    // Marks seq as an agent stream (or as an ordinary sequence again). Set before its first token is decoded.
+    LLAMA_API void llama_tab_set_agent(struct llama_context * ctx, llama_seq_id seq, bool agent);
+    // The agent sequence reads the tab from now on. Also marks it as an agent stream. False if an id is out of range.
+    LLAMA_API bool llama_tab_attach(struct llama_context * ctx, llama_seq_id agent, llama_seq_id tab);
+    // The agent sequence stops reading the tab; tab < 0: every tab.
+    LLAMA_API void llama_tab_detach(struct llama_context * ctx, llama_seq_id agent, llama_seq_id tab);
+
     LLAMA_API void llama_kv_cache_seq_keep(
             struct llama_context * ctx,
                     llama_seq_id   seq_id);

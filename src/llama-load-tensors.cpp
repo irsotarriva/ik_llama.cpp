@@ -89,6 +89,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_lfm2_tensors(const LLM_TN & tn);
 
+    bool create_tabsplit_tensors(const LLM_TN & tn);
+
     bool create_qwen4exp_tensors(const LLM_TN & tn);
 
     bool create_qwen35moe_tensors(const LLM_TN & tn);
@@ -1645,6 +1647,60 @@ bool create_tensors_helper::create_qwen3_moe_tensors(const LLM_TN & tn) {
 
         use_mmap_buffer &= !create_std_ffn_exps(n_embd, tn, i);
 
+    }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_tabsplit_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+    const int64_t n_split  = hparams.n_tab_split;
+    const int64_t n_ff_exp = hparams.n_ff_exp;
+
+    // the embedding table is narrower than the model
+    const std::string embd_name = tn(LLM_TENSOR_TOKEN_EMBD, "weight");
+    const ggml_tensor * embd_meta = ml.require_tensor_meta(embd_name.c_str());
+    const int64_t n_embd_tok = embd_meta->ne[0];
+
+    model.tok_embd      = create_tensor(ctx_input,  embd_name, {n_embd_tok, n_vocab});
+    model.tab_embd_up   = create_tensor(ctx_input,  tn(LLM_TENSOR_TAB_EMBD_UP,   "weight"), {n_embd_tok, n_embd});
+    model.output_norm   = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM,   "weight"), {n_embd});
+    model.tab_embd_down = create_tensor(ctx_output, tn(LLM_TENSOR_TAB_EMBD_DOWN, "weight"), {n_embd, n_embd_tok});
+    // the head is the embedding table
+    model.output        = create_tensor(ctx_output, embd_name, {n_embd_tok, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+
+    {
+        ggml_context * ctx_kv = ctx_for_layer(n_split);
+        model.tab_kv_norm = create_tensor(ctx_kv, tn(LLM_TENSOR_TAB_KV_NORM, "weight"), {n_embd});
+        model.tab_k       = create_tensor(ctx_kv, tn(LLM_TENSOR_TAB_K,       "weight"), {n_embd, n_embd_k_gqa});
+        model.tab_v       = create_tensor(ctx_kv, tn(LLM_TENSOR_TAB_V,       "weight"), {n_embd, n_embd_v_gqa});
+    }
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        auto & layer = model.layers[i];
+
+        layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+        layer.wq        = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head_k * n_head});
+        if (i < n_split) {
+            // a decoder layer makes only a query
+            layer.wk    = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,    "weight", i), {n_embd, n_embd_k_gqa});
+            layer.wv    = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,    "weight", i), {n_embd, n_embd_v_gqa});
+        }
+        layer.wo        = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_k * n_head, n_embd});
+
+        layer.ffn_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd});
+
+        // the always-on expert
+        layer.ffn_up     = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff});
+        layer.ffn_up_b   = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "bias",   i), {n_ff});
+        layer.ffn_down   = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
+        layer.ffn_down_b = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN, "bias",   i), {n_embd});
+
+        // the routed experts: no gate, a bias on the way up
+        layer.ffn_gate_inp  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert});
+        layer.ffn_up_exps   = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert});
+        layer.ffn_up_exps_b = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP_EXPS,   "bias",   i), {n_ff_exp, n_expert});
+        layer.ffn_down_exps = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert});
     }
     return use_mmap_buffer;
 }
@@ -5925,6 +5981,8 @@ bool create_tensors_helper::create_tensors() {
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_QWEN3VLMOE:
             use_mmap_buffer = create_qwen3_moe_tensors(tn); break;
+        case LLM_ARCH_TABSPLIT:
+            use_mmap_buffer = create_tabsplit_tensors(tn); break;
         case LLM_ARCH_MELLUM:
             use_mmap_buffer = create_mellum_tensors(tn); break;
         case LLM_ARCH_LFM2:

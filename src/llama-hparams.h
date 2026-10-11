@@ -55,6 +55,8 @@ struct llama_hparams {
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
     uint32_t n_ff_exp           = 0;
+    uint32_t n_tab_split        = 0; // split tab model: number of encoder layers; the decoder layers read one shared K/V
+    uint32_t n_tab_agent_pos    = 0; // split tab model: first position of the agent stream
     uint32_t n_ff_shexp         = 0;
     uint32_t n_expert_shared    = 0;
     // K2 Horizon MoVA

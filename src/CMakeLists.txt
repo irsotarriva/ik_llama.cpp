@@ -71,6 +71,7 @@ add_library(llama
             unicode-script-data.cpp
             # graphs
             graphs/build_llama.cpp
+            graphs/build_tabsplit.cpp
             graphs/build_muse_glimmer.cpp
             graphs/build_mistral3.cpp
             graphs/build_deci.cpp

@@ -6317,7 +6317,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
         const int64_t n_tokens = batch.n_tokens;
         const int n_pos_per_embd =  hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+        if (lctx.model.arch == LLM_ARCH_TABSPLIT && !lctx.tab_agent.empty() && batch.seq_id) {
+            // an agent stream counts from the position the model was trained with for it
+            std::vector<llama_pos> pos(batch.pos, batch.pos + n_tokens);
+            for (int64_t j = 0; j < n_tokens; ++j) {
+                if (lctx.tab_is_agent(batch.seq_id[j][0])) {
+                    pos[j] += (llama_pos) hparams.n_tab_agent_pos;
+                }
+            }
+            ggml_backend_tensor_set(lctx.inp_pos, pos.data(), 0, n_tokens*ggml_element_size(lctx.inp_pos));
+        } else {
         ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(lctx.inp_pos));
+        }
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
         printf("set_inputs(pos): %d us\n", int(tim2-tim1));
@@ -6397,6 +6408,78 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         auto tim2 = ggml_time_us();
         printf("set_inputs(outputs): %d us\n", int(tim2-tim1));
 #endif
+    }
+
+    if (lctx.inp_tab_mask_enc || lctx.inp_tab_mask_dec) {
+        // The split tab model. In the encoder a token sees the earlier cells of its own sequence. In
+        // the decoder an agent token also sees every cell of the tabs attached to its sequence
+        // (llama_tab_attach), whatever their positions.
+        const int64_t n_kv     = kv_self.n;
+        const int64_t n_tokens = batch.n_tokens;
+
+        // the rows the decoder runs on, in the order of inp_out_ids
+        std::vector<int32_t> rows_dec;
+        if (lctx.n_outputs == n_tokens) {
+            for (int32_t j = 0; j < n_tokens; ++j) rows_dec.push_back(j);
+        } else if (batch.logits) {
+            for (int32_t j = 0; j < n_tokens; ++j) if (batch.logits[j]) rows_dec.push_back(j);
+        } else if (lctx.n_outputs == 1) {
+            rows_dec.push_back((int32_t) n_tokens - 1);
+        }
+
+        // per cell, for the sequence in hand: 0 not visible, 1 own sequence (up to the token's position), 2 an attached tab
+        std::vector<uint8_t> kind(n_kv);
+        llama_seq_id kind_seq = -1;
+        auto set_kind = [&](llama_seq_id seq, bool decoder) {
+            kind_seq = seq;
+            const std::vector<llama_seq_id> * view = nullptr;
+            if (decoder && seq >= 0 && (size_t) seq < lctx.tab_view.size() && !lctx.tab_view[seq].empty()) {
+                view = &lctx.tab_view[seq];
+            }
+            for (int64_t i = 0; i < n_kv; ++i) {
+                const llama_kv_cell & cell = kv_self.cells[i];
+                uint8_t k = cell.has_seq_id(seq) ? 1 : 0;
+                if (!k && view) {
+                    for (llama_seq_id t : *view) {
+                        if (cell.has_seq_id(t)) { k = 2; break; }
+                    }
+                }
+                kind[i] = k;
+            }
+        };
+        auto fill = [&](ggml_tensor * t, bool decoder, int64_t n_rows) {
+            if (!t || !t->buffer) return;
+            GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+            GGML_ASSERT(t->ne[0] == n_kv && t->ne[1] >= n_rows);
+            const bool      f16    = t->type == GGML_TYPE_F16;
+            float     *     d32    = f16 ? nullptr : (float *) t->data;
+            ggml_half *     d16    = f16 ? (ggml_half *) t->data : nullptr;
+            const ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_half h_zero = ggml_fp32_to_fp16(0.0f);
+            kind_seq = -1;
+            for (int64_t r = 0; r < t->ne[1]; ++r) {
+                const int32_t j = r >= n_rows ? -1 : decoder ? rows_dec[r] : (int32_t) r;
+                if (j >= 0 && batch.seq_id[j][0] != kind_seq) {
+                    set_kind(batch.seq_id[j][0], decoder);
+                }
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    const bool see = j >= 0 && (kind[i] == 2 || (kind[i] == 1 && kv_self.cells[i].pos <= batch.pos[j]));
+                    if (f16) d16[r*n_kv + i] = see ? h_zero : h_inf;
+                    else     d32[r*n_kv + i] = see ? 0.0f : -INFINITY;
+                }
+            }
+        };
+        fill(lctx.inp_tab_mask_enc, false, n_tokens);
+        fill(lctx.inp_tab_mask_dec, true,  (int64_t) rows_dec.size());
+
+        if (lctx.inp_tab_pos_out && lctx.inp_tab_pos_out->buffer) {
+            GGML_ASSERT(lctx.inp_tab_pos_out->ne[0] == (int64_t) rows_dec.size());
+            int32_t * data = (int32_t *) lctx.inp_tab_pos_out->data;
+            for (size_t r = 0; r < rows_dec.size(); ++r) {
+                const int32_t j = rows_dec[r];
+                data[r] = batch.pos[j] + (lctx.tab_is_agent(batch.seq_id[j][0]) ? (llama_pos) hparams.n_tab_agent_pos : 0);
+            }
+        }
     }
 
     GGML_ASSERT(
@@ -9405,7 +9488,7 @@ struct llama_context * llama_init_from_model(
     }
 
     if (model->arch != LLM_ARCH_OPENPANGU &&
-        params.type_v != GGML_TYPE_F16 && params.type_v != GGML_TYPE_BF16 && !params.flash_attn) {
+        params.type_v != GGML_TYPE_F16 && params.type_v != GGML_TYPE_BF16 && params.type_v != GGML_TYPE_F32 && !params.flash_attn) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
         return nullptr;
     }
@@ -10258,6 +10341,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_DFLASH:
+        case LLM_ARCH_TABSPLIT:
         case LLM_ARCH_MUSE_GLIMMER:
             return LLAMA_ROPE_TYPE_NORM;
 
@@ -11044,6 +11128,59 @@ int32_t llama_kv_cache_seq_rm_cells(struct llama_context * ctx, llama_seq_id seq
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
     ctx->ple_hist.erase(seq_id);
     return n;
+}
+
+bool llama_model_has_tabs(const struct llama_model * model) {
+    return model->arch == LLM_ARCH_TABSPLIT;
+}
+
+int32_t llama_model_tab_agent_pos(const struct llama_model * model) {
+    return (int32_t) model->hparams.n_tab_agent_pos;
+}
+
+static bool llama_tab_seq_ok(struct llama_context * ctx, llama_seq_id seq) {
+    const uint32_t n = llama_n_seq_max(ctx);
+    if (seq < 0 || (uint32_t) seq >= n) {
+        return false;
+    }
+    if (ctx->tab_agent.size() < n) {
+        ctx->tab_agent.resize(n, 0);
+        ctx->tab_view.resize(n);
+    }
+    return true;
+}
+
+void llama_tab_set_agent(struct llama_context * ctx, llama_seq_id seq, bool agent) {
+    if (llama_tab_seq_ok(ctx, seq)) {
+        ctx->tab_agent[seq] = agent;
+        if (!agent) {
+            ctx->tab_view[seq].clear();
+        }
+    }
+}
+
+bool llama_tab_attach(struct llama_context * ctx, llama_seq_id agent, llama_seq_id tab) {
+    if (agent == tab || !llama_tab_seq_ok(ctx, agent) || !llama_tab_seq_ok(ctx, tab)) {
+        return false;
+    }
+    ctx->tab_agent[agent] = 1;
+    auto & view = ctx->tab_view[agent];
+    if (std::find(view.begin(), view.end(), tab) == view.end()) {
+        view.push_back(tab);
+    }
+    return true;
+}
+
+void llama_tab_detach(struct llama_context * ctx, llama_seq_id agent, llama_seq_id tab) {
+    if (!llama_tab_seq_ok(ctx, agent)) {
+        return;
+    }
+    auto & view = ctx->tab_view[agent];
+    if (tab < 0) {
+        view.clear();
+    } else {
+        view.erase(std::remove(view.begin(), view.end(), tab), view.end());
+    }
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
