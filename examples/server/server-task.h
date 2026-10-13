@@ -65,6 +65,7 @@ struct server_tab_request {
 struct slot_params {
     std::vector<server_cache_breakpoint> cache_breakpoints;
     std::vector<server_tab_request> tabs;
+    bool draft = false;         // the prompt is a text still being typed: read it, generate nothing ("draft")
     bool stream = true;
     bool include_usage = false;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt
