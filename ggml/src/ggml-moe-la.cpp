@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -45,9 +46,22 @@ inline uintptr_t page_ceil (uintptr_t x) { return (x + LA_PAGE - 1) & ~(uintptr_
 
 // ---- platform: reserved ranges and unbuffered positional reads ----------
 
+#if defined(__linux__)
+// On Linux every change of protection inside a range splits its mapping, and a process may hold
+// 65,530 mappings (vm.max_map_count; a container cannot raise it). A model with 48 layers of 512
+// experts in three tensors has 73,728 expert ranges, so a half-resident cache runs out and mprotect
+// fails. The ranges are therefore mapped readable once and only their pages are given back.
+// LA_GUARD=1 brings the protection back: an expert that is not resident then faults when read.
+const bool LA_GUARD = getenv("LA_GUARD") && atoi(getenv("LA_GUARD")) != 0;
+#endif
+
 uint8_t * os_reserve(size_t size) {
 #if defined(_WIN32)
     return (uint8_t *) VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+#elif defined(__linux__)
+    void * p = LA_GUARD ? mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                        : mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return p == MAP_FAILED ? nullptr : (uint8_t *) p;
 #else
     void * p = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? nullptr : (uint8_t *) p;
@@ -57,6 +71,8 @@ uint8_t * os_reserve(size_t size) {
 bool os_commit(uint8_t * p, size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#elif defined(__linux__)
+    return !LA_GUARD || mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
 #else
     return mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
 #endif
@@ -71,6 +87,9 @@ void os_release(uint8_t * p, size_t size) {
     mmap(p, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #else
     madvise(p, size, MADV_DONTNEED);
+#if defined(__linux__)
+    if (!LA_GUARD) return;
+#endif
     mprotect(p, size, PROT_NONE);
 #endif
 }
@@ -545,7 +564,13 @@ struct la_state {
         n_out = (size_t) (hi - lo);
         // lo may sit a little before data (then it holds the tail of the tensor stored before this one)
         const uint64_t off = (uint64_t) ((int64_t) t.file_off + (int64_t) (lo - t.data));
-        return fds[t.file_id] != LA_BAD_FD && os_commit(lo, n_out) && os_pread(fds[t.file_id], lo, n_out, off);
+        const char * step = fds[t.file_id] == LA_BAD_FD ? "open" : !os_commit(lo, n_out) ? "commit"
+                          : !os_pread(fds[t.file_id], lo, n_out, off) ? "read" : nullptr;
+        if (step) {
+            fprintf(stderr, "moe-la: %s failed for %zu bytes at offset %llu of %s: %s\n", step, n_out,
+                    (unsigned long long) off, files[t.file_id].c_str(), strerror(errno));
+        }
+        return step == nullptr;
     }
 
     // background reader: fills the pages of an expert nobody is using yet; the layer
