@@ -643,6 +643,11 @@ struct llama_model {
     layer_buft buft_output;
     std::vector<layer_buft> buft_layer;
 
+    // The load-aware selector keeps one set of layers for the process. It belongs to the first model
+    // loaded with it on, the one that generates; a model loaded beside it (an MTP companion, a draft
+    // model) routes and holds its experts as without the selector.
+    bool la_owner = false;
+
     // load-aware VRAM tier: per layer, GPU copies of some experts (gate, up, down), or nulls
     std::vector<std::array<struct ggml_tensor *, 3>> la_slots;
     // GPU scratch tensors for prompt batches, shaped like a layer's expert tensors; layers with the

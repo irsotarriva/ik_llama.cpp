@@ -55,7 +55,7 @@ llm_build_context::llm_build_context(
         n_embd_head_v    (hparams.n_embd_head_v(0)),
         n_embd_v_gqa     (hparams.n_embd_v_gqa()),
         n_expert         (hparams.n_expert),
-        n_expert_used    (warmup && !ggml_moe_la_real_active() ? hparams.n_expert : hparams.n_expert_used),
+        n_expert_used    (warmup && !(lctx.model.la_owner && ggml_moe_la_real_active()) ? hparams.n_expert : hparams.n_expert_used),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),
@@ -1609,7 +1609,7 @@ llm_expert_gating_func_type   gating_op,
         } else {
             //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
             //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
-            if (ggml_moe_la_active() && n_expert_used < n_expert) {
+            if (lctx.model.la_owner && ggml_moe_la_active() && n_expert_used < n_expert) {
                 selected_experts = ggml_moe_la_topk(ctx, selection_probs, n_expert_used, il);
             } else {
                 selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
@@ -1619,7 +1619,7 @@ llm_expert_gating_func_type   gating_op,
     cb(selected_experts, "ffn_moe_topk", il);
 
     // load-aware read-ahead: guess what the next layer will route to from this layer's input
-    if (graph && ggml_moe_la_prefetch_active((int) n_tokens) && n_expert_used < n_expert && il >= 0 &&
+    if (graph && lctx.model.la_owner && ggml_moe_la_prefetch_active((int) n_tokens) && n_expert_used < n_expert && il >= 0 &&
         il + 1 < (int) lctx.model.layers.size() && lctx.model.layers[il + 1].ffn_gate_inp &&
         !lctx.model.layers[il + 1].ffn_gate_inp->extra) {
         ggml_tensor * next_logits = llm_build_lora_mm(lctx, ctx, lctx.model.layers[il + 1].ffn_gate_inp, input);
