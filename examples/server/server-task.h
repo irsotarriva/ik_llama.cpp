@@ -57,6 +57,7 @@ struct server_cache_breakpoint {
 
 struct slot_params {
     std::vector<server_cache_breakpoint> cache_breakpoints;
+    bool draft = false;         // the prompt is a text still being typed: read it, generate nothing ("draft")
     bool stream = true;
     bool include_usage = false;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt

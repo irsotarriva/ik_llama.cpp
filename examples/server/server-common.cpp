@@ -816,13 +816,55 @@ json oaicompat_chat_params_parse(
 
     common_chat_templates_inputs inputs;
     inputs.messages = common_chat_msgs_parse_oaicompat(messages);
+
+    // "draft": the last message is a user message that is still being typed. Its text is read into the
+    // context now and nothing is generated, so the request that follows when the user sends it finds
+    // most of its prompt already there (README-draft.md). The prompt of a draft is the prompt of the
+    // conversation cut where the text ends; a marker put after the text says where that is.
+    const bool draft = json_value(body, "draft", false);
+    static const std::string draft_end = "<<la-draft-end-7f3a>>";
+    int draft_hold_tokens = 1;
+    if (draft) {
+        if (inputs.messages.empty() || inputs.messages.back().role != "user") {
+            throw std::runtime_error("\"draft\" needs a user message at the end of the list");
+        }
+        common_chat_msg & last = inputs.messages.back();
+        std::string * text = &last.content;
+        if (!last.content_parts.empty()) {
+            if (last.content_parts.back().type != "text") {
+                throw std::runtime_error("a draft must end in text");
+            }
+            text = &last.content_parts.back().text;
+        }
+        // The word being typed is left out, with the blanks before it: both read as other tokens once
+        // the word is finished. A long run without blanks (text in a script that does not use them) is
+        // kept, and more tokens are held back at its end instead.
+        const auto blank = [](char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; };
+        size_t n = text->size();
+        if (n > 0 && !blank((*text)[n - 1])) {
+            size_t w = n;
+            while (w > 0 && !blank((*text)[w - 1])) {
+                w--;
+            }
+            if (n - w <= 48) {
+                n = w;
+            } else {
+                draft_hold_tokens = 4;
+            }
+        }
+        while (n > 0 && blank((*text)[n - 1])) {
+            n--;
+        }
+        text->resize(n);
+        text->append(draft_end);
+    }
     inputs.tools = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar = grammar;
     inputs.use_jinja = opt.use_jinja;
     inputs.parallel_tool_calls = json_value(body, "parallel_tool_calls", opt.parallel_tool_calls);
-    inputs.add_generation_prompt = json_value(body, "add_generation_prompt", true);
+    inputs.add_generation_prompt = !draft && json_value(body, "add_generation_prompt", true);
     inputs.reasoning_format = opt.reasoning_format;
     if (body.contains("reasoning_format")) {
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
@@ -878,6 +920,13 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    if (draft) {
+        const size_t at = chat_params.prompt.rfind(draft_end);
+        if (at == std::string::npos) {
+            throw std::runtime_error("the chat template does not keep the text of the draft in place");
+        }
+        chat_params.prompt.erase(at);
+    }
 
     // Where a marked message ends in the prompt: the prompt of the messages up to it, if the full
     // prompt starts with that (a template may write an earlier message differently once others follow).
@@ -980,6 +1029,14 @@ json oaicompat_chat_params_parse(
         // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
         if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
             llama_params[item.key()] = item.value();
+        }
+    }
+    if (draft) {
+        llama_params["n_predict"] = 0;
+        llama_params["stream"] = false;
+        llama_params["cache_prompt"] = true;
+        if (!body.contains("draft_hold_tokens")) {
+            llama_params["draft_hold_tokens"] = draft_hold_tokens;
         }
     }
 

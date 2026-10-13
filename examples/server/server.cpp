@@ -1156,6 +1156,11 @@ int main(int argc, char ** argv) {
                     // Everything else, including multimodal completions.
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
+                if (inputs.size() == 1 && json_value(data, "draft", false)) {
+                    // the last tokens of a text that goes on may read differently once it does
+                    const int hold = std::max(0, json_value(data, "draft_hold_tokens", 1));
+                    inputs[0].keep_first((size_t) std::max(0, (int) inputs[0].size() - hold));
+                }
                 if (inputs.size() == 1 && data.contains("cache_breakpoints")) {
                     json prompt_copy = prompt;      // `prompt` refers into `data`, which is changed here
                     resolve_cache_breakpoints(llama_get_vocab(ctx_server.ctx), data, prompt_copy, inputs[0]);

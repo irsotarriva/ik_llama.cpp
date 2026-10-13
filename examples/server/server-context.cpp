@@ -1210,6 +1210,12 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         }
     }
     slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", json_value(data, "max_completion_tokens", defaults.n_predict)));
+    slot.params.draft = json_value(data, "draft", false);
+    if (slot.params.draft) {
+        slot.params.n_predict = 0;
+        slot.params.stream = false;
+        slot.params.cache_prompt = true;
+    }
     slot.saturate_predict = json_value(data, "saturate_predict", false);
     slot.sparams.top_k = json_value(data, "top_k", default_sparams.top_k);
     slot.sparams.top_p = json_value(data, "top_p", default_sparams.top_p);
@@ -4304,6 +4310,20 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             int32_t size_threshold = 20;
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
+                            if (slot.params.draft && prefix.second == slot.n_prompt_tokens) {
+                                // The context already holds all of this draft (the same text again, or
+                                // the end of it deleted). A draft never takes the context back: what
+                                // the user sends decides that.
+                                SLT_WRN(slot, "draft: all %d tokens are in the context, nothing to read\n", slot.n_prompt_tokens);
+                                slot.n_prompt_tokens_cache = slot.n_prompt_tokens;
+                                slot.n_prompt_tokens_processed = 0;
+                                slot.n_past = (int32_t) slot.cache_tokens.size();
+                                slot.state = SLOT_STATE_PROCESSING;
+                                slot.command = SLOT_COMMAND_NONE;
+                                send_final_response(slot);
+                                slot.release();
+                                continue;
+                            }
                             if (!llama_model_supports_partial_kv_reuse(model) &&
                                 slot.n_past < (int32_t) slot.cache_tokens.size()) {
                                 // the cache diverges from the new prompt mid-sequence; this
@@ -5131,6 +5151,18 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (slot.embedding) {
                 send_embedding(slot, batch_view);
                 slot.release();
+                slot.i_batch = -1;
+                continue; // continue loop of slots
+            }
+
+            // a draft: its text is in the context now; nothing is sampled, and the checkpoint taken on
+            // release is where an edit of the text can go back to
+            if (slot.params.draft) {
+                slot.t_start_generation = ggml_time_us();
+                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                metrics.on_prompt_eval(slot);
+                send_final_response(slot);
+                release_slot_after_final_response(slot);
                 slot.i_batch = -1;
                 continue; // continue loop of slots
             }
