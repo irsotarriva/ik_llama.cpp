@@ -39,7 +39,10 @@ Others, with their defaults: `LA_THETA` (0; drop weak experts, not useful on sto
 `LA_DECAY` (decay of the request counts), `LA_PRICE_RESIDENT` (0.1), `LA_EXCESS_RAM` (0; extra price
 for RAM against VRAM), `LA_IO_THREADS` (8), `LA_PREFETCH` (0; read one layer ahead), `LA_ASYNC`,
 `LA_ASYNC_RATE`, `LA_ASYNC_QUEUE`, `LA_ASYNC_THREADS` (background loading of substituted experts,
-costs speed in real mode), `LA_STATS=file` (append one JSON line of counters at exit).
+costs speed in real mode), `LA_STATS=file` (append one JSON line of counters at exit),
+`LA_GUARD` (0; Linux, real mode: 1 makes an expert that is not in memory fault when read, at the
+price of one memory mapping per expert range, which a model with more than about 60,000 ranges
+cannot afford).
 
 ## The lookup table (`--defer-ple`)
 
