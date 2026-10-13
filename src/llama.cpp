@@ -5434,7 +5434,18 @@ static bool llm_load_tensors(
         llm_requantize_output_tensor(model, extra_output_type);
     }
 
-    if (ggml_moe_la_gpu_active() && !dry_run) {
+    if (ggml_moe_la_active() && !dry_run) {
+        // A second model must not touch the selector's layers: an MTP companion has no routed experts
+        // in the layers of its target, so its load dropped the target's GPU slots, and in real mode
+        // it started the cache a second time (the starting set was read twice).
+        static std::atomic<bool> la_claimed{false};
+        model.la_owner = !la_claimed.exchange(true);
+        if (!model.la_owner) {
+            LLAMA_LOG_INFO("%s: the load-aware selector belongs to the model loaded before this one; this one runs without it\n", __func__);
+        }
+    }
+
+    if (model.la_owner && ggml_moe_la_gpu_active() && !dry_run) {
         // load-aware VRAM tier: copy the most used experts of each layer into GPU slot tensors
         const int gpu_id = (model.main_gpu >= 0 && model.main_gpu < (int) model.devices.size())
             ? model.devices[model.main_gpu] : std::max(0, (int) model.main_gpu);
@@ -5535,7 +5546,7 @@ static bool llm_load_tensors(
         }
     }
 
-    if (ggml_moe_la_real_active() && !dry_run) {
+    if (model.la_owner && ggml_moe_la_real_active() && !dry_run) {
         // load-aware real mode: the selector takes over the memory of the routed experts
         int n_taken = 0;
         for (int il = 0; il < (int) model.layers.size(); ++il) {
