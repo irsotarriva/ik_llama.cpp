@@ -10422,3 +10422,213 @@ template [[host_name("kernel_mul_mv_id_iq3_k_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_k_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_k_f32_impl>>;
 template [[host_name("kernel_mul_mv_id_iq5_k_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq5_k_f32_impl>>;
 template [[host_name("kernel_mul_mv_id_iq6_k_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq6_k_f32_impl>>;
+
+// ---- linear attention (Qwen3-Next, Qwen3.6, Qwen3.8: src/llama-delta-net.cpp) ----------------
+// Written to follow the CPU kernels exactly (ggml.c and iqk_fused_delta_net_impl); the shape of the
+// delta-net kernel is MLX's gated_delta_seq (mlx/backend/metal/kernels/gated_delta_update.h, MIT).
+
+kernel void kernel_softplus(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float x = src0[tpig];
+    dst[tpig] = x > 20.0f ? x : precise::log(1.0f + precise::exp(x));
+}
+
+// one simdgroup per row
+kernel void kernel_l2_norm(
+        device const char * src0,
+        device       char * dst,
+        constant  int64_t & ne00,
+        constant uint64_t & nb01,
+        constant uint64_t & nb02,
+        constant uint64_t & nb03,
+        constant uint64_t & nb1,
+        constant uint64_t & nb2,
+        constant uint64_t & nb3,
+        constant    float & eps,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]]) {
+    device const float * x = (device const float *) (src0 + tgpig.x*nb01 + tgpig.y*nb02 + tgpig.z*nb03);
+    device       float * y = (device       float *) (dst  + tgpig.x*nb1  + tgpig.y*nb2  + tgpig.z*nb3);
+
+    float sum = 0.0f;
+    for (int64_t i = tiisg; i < ne00; i += 32) {
+        sum += x[i]*x[i];
+    }
+    sum = simd_sum(sum);
+
+    const float scale = 1.0f/max(sqrt(sum), eps);
+    for (int64_t i = tiisg; i < ne00; i += 32) {
+        y[i] = x[i]*scale;
+    }
+}
+
+// One thread per row of d_inner, all tokens in turn. dst holds the outputs {d_inner, n_tokens} and then
+// the states {d_conv, d_inner, n_kv}; as on the CPU, a state is shifted in place from the second token on.
+kernel void kernel_ssm_conv_f32(
+        device const char    * src0,     // conv state {d_conv - 1, d_inner, n_kv}
+        device const char    * src1,     // x {d_inner, n_tokens}
+        device const char    * src2,     // weights {d_conv, d_inner}
+        device const char    * src3,     // sequence ids {n_kv, n_tokens}, i32
+        device       float   * saved,    // {d_conv - 1, d_inner, n_tokens} when save != 0
+        device       float   * dst,
+        constant     int32_t & nc,
+        constant     int32_t & nr,
+        constant     int32_t & n_t,
+        constant     int32_t & n_kv,
+        constant     int32_t & save,
+        constant    uint64_t & nb01,
+        constant    uint64_t & nb02,
+        constant    uint64_t & nb10,
+        constant    uint64_t & nb11,
+        constant    uint64_t & nb21,
+        constant    uint64_t & nb31,
+        uint tpig[[thread_position_in_grid]]) {
+    const int row = (int) tpig;
+    if (row >= nr) {
+        return;
+    }
+    device float * states = dst + (int64_t) nr*n_t;
+
+    if (n_kv > 1) {
+        // as on the CPU: with several sequences every state is copied over first
+        for (int i3 = 0; i3 < n_kv; ++i3) {
+            device const float * s0 = (device const float *) (src0 + row*nb01 + i3*nb02);
+            device       float * s  = states + ((int64_t) i3*nr + row)*nc;
+            for (int i0 = 0; i0 < nc - 1; ++i0) {
+                s[1 + i0] = s0[i0];
+            }
+        }
+    }
+
+    device const float * c = (device const float *) (src2 + row*nb21);
+
+    for (int t = 0; t < n_t; ++t) {
+        device const int32_t * sq = (device const int32_t *) (src3 + t*nb31);
+        const int seq0 = sq[0];
+        device float * s = states + ((int64_t) seq0*nr + row)*nc;
+
+        if (t == 0) {
+            device const float * s0 = (device const float *) (src0 + row*nb01 + seq0*nb02);
+            for (int i0 = 0; i0 < nc - 1; ++i0) {
+                s[i0] = s0[i0];
+            }
+        } else {
+            for (int i0 = 0; i0 < nc - 1; ++i0) {
+                s[i0] = s[i0 + 1];
+            }
+        }
+        s[nc - 1] = *((device const float *) (src1 + row*nb10 + t*nb11));
+
+        if (save != 0) {
+            device float * y = saved + ((int64_t) t*nr + row)*(nc - 1);
+            for (int i0 = 0; i0 < nc - 1; ++i0) {
+                y[i0] = s[i0 + 1];
+            }
+        }
+
+        for (int i3 = 1; i3 < n_kv; ++i3) {
+            const int seq = sq[i3];
+            if (seq < 0 || seq >= n_kv) {
+                break;
+            }
+            device float * s1 = s + (int64_t) (seq - seq0)*nc*nr;
+            for (int i0 = 0; i0 < nc; ++i0) {
+                s1[i0] = s[i0];
+            }
+        }
+
+        float sum = 0.0f;
+        for (int i0 = 0; i0 < nc; ++i0) {
+            sum += s[i0]*c[i0];
+        }
+        dst[(int64_t) t*nr + row] = sum;
+    }
+}
+
+// Gated delta rule with a scalar gate per head and token. A simdgroup owns one row of a head's state
+// (row = value dimension) and keeps it in registers, head_dim/32 columns per thread; four rows per
+// threadgroup. Layouts as on the CPU: q, k {D, T, H/gqa, S} contiguous; v by its strides; g and beta
+// indexed [S][T][H]; state {D, D*H, 1, S} with element (row, col) of head h at h*D*D + row + col*D.
+kernel void kernel_delta_net_f32(
+        device const float * q,
+        device const float * k,
+        device const float * v,
+        device const float * g,
+        device const float * beta,
+        device const float * state_in,
+        device       float * saved,
+        device       float * dst,
+        constant   int32_t & D,
+        constant   int32_t & T,
+        constant   int32_t & H,
+        constant   int32_t & S,
+        constant   int32_t & gqa,
+        constant   int32_t & repeat,
+        constant   int32_t & save,
+        constant  uint64_t & vnb1,
+        constant  uint64_t & vnb2,
+        constant  uint64_t & vnb3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]]) {
+    const int row  = tgpig.x*4 + tpitg.y;
+    const int h    = tgpig.y;
+    const int b    = tgpig.z;
+    const int h_kq = repeat == 0 ? h / gqa : h % (H/gqa);
+    const int n_per = D/32;
+
+    const int64_t qk_off = (int64_t) b*D*T*(H/gqa) + (int64_t) h_kq*D*T;
+    device const float * q_h    = q + qk_off;
+    device const float * k_h    = k + qk_off;
+    device const float * v_h    = v + b*vnb3 + h*vnb2;
+    device const float * g_h    = g    + (int64_t) b*T*H + h;
+    device const float * beta_h = beta + (int64_t) b*T*H + h;
+
+    const int64_t state_off = (int64_t) b*D*D*H + (int64_t) h*D*D;
+    const int64_t step      = (int64_t) D*D*H*S;
+    device float * out_h     = dst + (int64_t) b*D*H*T + (int64_t) h*D;
+    device float * state_out = dst + (int64_t) D*H*T*S + state_off;
+
+    float st[4];
+    for (int i = 0; i < n_per; ++i) {
+        st[i] = state_in[state_off + row + (int64_t) (tiisg + 32*i)*D];
+    }
+    const float scale = 1.0f/sqrt((float) D);
+
+    for (int t = 0; t < T; ++t) {
+        float qv[4], kv[4];
+        float kq = 0.0f, vp = 0.0f, ov = 0.0f;
+        for (int i = 0; i < n_per; ++i) {
+            const int col = tiisg + 32*i;
+            qv[i] = q_h[(int64_t) t*D + col];
+            kv[i] = k_h[(int64_t) t*D + col];
+            kq += qv[i]*kv[i];
+            vp += st[i]*kv[i];
+            ov += st[i]*qv[i];
+        }
+        kq = simd_sum(kq);
+        vp = simd_sum(vp);
+        ov = simd_sum(ov);
+
+        const float beta_val = 1.0f/(1.0f + precise::exp(-beta_h[(int64_t) t*H]));
+        const float decay    = precise::exp(min(g_h[(int64_t) t*H], 50.0f));
+        const float v_new    = v_h[t*vnb1 + row]*beta_val - vp*beta_val*decay;
+
+        if (tiisg == 0) {
+            out_h[(int64_t) t*D*H + row] = ov*decay*scale + v_new*(kq*scale);
+        }
+        for (int i = 0; i < n_per; ++i) {
+            st[i] = clamp(decay*st[i] + v_new*kv[i], -1e6f, 1e6f);
+        }
+        if (save != 0 && t + 1 < T) {
+            for (int i = 0; i < n_per; ++i) {
+                saved[state_off + (int64_t) t*step + row + (int64_t) (tiisg + 32*i)*D] = st[i];
+            }
+        }
+    }
+    for (int i = 0; i < n_per; ++i) {
+        state_out[row + (int64_t) (tiisg + 32*i)*D] = st[i];
+    }
+}
