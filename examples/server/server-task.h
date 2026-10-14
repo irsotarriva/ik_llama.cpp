@@ -53,6 +53,7 @@ struct server_cache_breakpoint {
     int32_t n_tokens = 0;       // the checkpoint is taken after this many prompt tokens
     bool    persist  = false;   // also keep the state on disk (needs LA_CACHE_DIR)
     int64_t ttl_s    = 0;       // ... for this long after its last use
+    bool    server   = false;   // placed by the server (the start of the last message), not by the client
 };
 
 // A tab the request has open ("tabs"): a piece of context that is encoded apart from the prompt.

@@ -931,6 +931,42 @@ json oaicompat_chat_params_parse(
     // Where a marked message ends in the prompt: the prompt of the messages up to it, if the full
     // prompt starts with that (a template may write an earlier message differently once others follow).
     json cache_breakpoints = json_value(body, "cache_breakpoints", json::array());
+
+    // The server's own point: where the last message opens (LA_LAST_MSG_POINT, on unless set to 0).
+    // The conversation is rendered twice more with the last message replaced by two different probes;
+    // the probes first differ where the message's text begins, and the prompt is cut there. Every
+    // later request that differs only in its last message (an edit, a new answer, a draft sent)
+    // resumes there without marks from the client. It is a checkpoint like the others, evicted like
+    // them, and only taken for models that cannot step back without one.
+    static const bool last_msg_point = [] {
+        const char * s = getenv("LA_LAST_MSG_POINT");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (last_msg_point && inputs.messages.size() >= 2) {
+        try {
+            const auto render_with = [&](const char * probe) {
+                common_chat_templates_inputs p = inputs;
+                common_chat_msg & last = p.messages.back();
+                last.content_parts.clear();
+                last.content = probe;
+                last.reasoning_content.clear();
+                last.tool_calls.clear();
+                return common_chat_templates_apply(opt.tmpls.get(), p).prompt;
+            };
+            const std::string a = render_with("\x01la-probe-a");
+            const std::string b = render_with("\x02la-probe-b");
+            const std::string & full = chat_params.prompt;
+            size_t at = 0;
+            while (at < a.size() && at < b.size() && at < full.size() && a[at] == b[at] && a[at] == full[at]) {
+                at++;
+            }
+            if (at > 0 && at < full.size()) {
+                cache_breakpoints.insert(cache_breakpoints.begin(), json{ {"chars", at}, {"server", true} });
+            }
+        } catch (const std::exception &) {
+            // the template does not accept the probe: no point
+        }
+    }
     for (size_t im = 0; im < cache_marks.size() && im < inputs.messages.size(); ++im) {
         if (cache_marks[im].is_null()) {
             continue;
