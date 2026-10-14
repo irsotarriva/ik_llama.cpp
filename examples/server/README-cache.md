@@ -36,6 +36,27 @@ On `/v1/chat/completions`, put `cache_control` on a message (or on one of its co
 - A mark is ignored without notice when the chat template writes that message differently once
   others follow it, or when its end does not fall between two tokens.
 
+### The server's own point: where the last message starts
+
+Without any mark, a chat request also gets a checkpoint where its last message begins: the request
+that follows an edit of that message, a regenerated answer with a changed question, or a draft
+that is then sent (README-draft.md) resumes there. The server finds the place by rendering the
+conversation twice more with the last message replaced by two probes; the prompt is cut where the
+probes first differ. This works whatever the template writes around a message, which a mark at
+the end of the previous message does not when the template writes that message differently once
+another follows (thinking text that is dropped from earlier turns, for one).
+
+- It is a checkpoint like the server's own: dropped by the usual rule, never written to disk.
+- Only models that cannot step back without one take it (Qwen3.6, Qwen3.8 and other recurrent or
+  hybrid models, with `--ctx-checkpoints` above 0); on plain attention the cache is cut at any
+  token anyway.
+- `LA_LAST_MSG_POINT=0` turns it off. The log says `the last message starts after N tokens` for
+  each chat request and `checkpoint at the start of the last message` when one is taken.
+
+Qwen3.6-35B-A3B, CPU, a 4-message conversation of 159 tokens, the last message then replaced
+(2026-10-14, `tests/test_last_msg_point.py` in the project folder): 143 of 159 tokens reused with the
+point, 0 without it (the whole prompt was read again).
+
 On `/completion` and `/v1/completions` the same is given directly:
 
 ```json

@@ -1205,6 +1205,10 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
             if (b.is_object()) {
                 bp.ttl_s   = b.contains("ttl") ? server_cache_parse_ttl(b.at("ttl")) : 0;
                 bp.persist = json_value(b, "persist", bp.ttl_s > 0) && bp.ttl_s > 0;
+                bp.server  = json_value(b, "server", false);
+            }
+            if (bp.server) {
+                SLT_INF(slot, "the last message starts after %d tokens\n", bp.n_tokens);
             }
             slot.params.cache_breakpoints.push_back(bp);
         }
@@ -3800,8 +3804,11 @@ void server_context::on_cache_breakpoint(server_slot & slot) {
     create_checkpoint(slot);
     auto & ckpts = slot.server_cached_prompt.checkpoints;
     const bool have_ckpt = !ckpts.empty() && ckpts.back().n_tokens == slot.cache_tokens.n_tokens();
-    if (have_ckpt) {
+    if (have_ckpt && !bp.server) {
         ckpts.back().client = true;
+    }
+    if (have_ckpt && bp.server) {
+        SLT_INF(slot, "checkpoint at the start of the last message (%d tokens)\n", bp.n_tokens);
     }
     if (!bp.persist || !cache_store.enabled()) {
         return;
@@ -4520,7 +4527,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     // a position the client marked: the batch ends here, so the state after it is exactly this prefix
                     if (slot.n_past_prompt < slot.n_prompt_tokens) {
                         for (size_t ib = 0; ib < slot.params.cache_breakpoints.size(); ++ib) {
-                            if (slot.params.cache_breakpoints[ib].n_tokens == slot.n_past_prompt) {
+                            const auto & bp = slot.params.cache_breakpoints[ib];
+                            // the server's own point only matters where a checkpoint is the way back
+                            if (bp.n_tokens == slot.n_past_prompt && (!bp.server || params_base.do_checkpoint)) {
                                 slot.breakpoint_hit = (int) ib;
                             }
                         }
