@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #endif
 
 namespace {
@@ -55,6 +59,24 @@ inline uintptr_t page_ceil (uintptr_t x) { return (x + LA_PAGE - 1) & ~(uintptr_
 const bool LA_GUARD = getenv("LA_GUARD") && atoi(getenv("LA_GUARD")) != 0;
 #endif
 
+// LA_WIRE=1 (not Windows): lock the pages of resident experts in memory. macOS compresses and swaps
+// anonymous memory it is short of, and an expert it has compressed is as slow to use as one read
+// from the disk; the CPU-only real cache generated at 0.04 tok/s on the 8 GB M1 against 0.31 stock,
+// which nothing measured explained. MLX wires its memory for the same reason (mx.set_wired_limit).
+// A lock that fails is counted, not fatal (Linux allows 8 MiB by default: ulimit -l).
+const bool LA_WIRE = getenv("LA_WIRE") && atoi(getenv("LA_WIRE")) != 0;
+std::atomic<uint64_t> g_wire_fail{0};
+// time spent in os_commit and os_release, all threads together: each is a system call per expert
+std::atomic<uint64_t> g_os_ns{0}, g_os_calls{0};
+
+struct os_timer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~os_timer() {
+        g_os_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_os_calls++;
+    }
+};
+
 uint8_t * os_reserve(size_t size) {
 #if defined(_WIN32)
     return (uint8_t *) VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
@@ -69,16 +91,29 @@ uint8_t * os_reserve(size_t size) {
 }
 
 bool os_commit(uint8_t * p, size_t size) {
+    os_timer timer;
 #if defined(_WIN32)
     return VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
-#elif defined(__linux__)
-    return !LA_GUARD || mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
 #else
-    return mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
+#if defined(__linux__)
+    const bool ok = !LA_GUARD || mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
+#else
+    const bool ok = mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
+#endif
+    if (ok && LA_WIRE && mlock(p, size) != 0) {
+        g_wire_fail++;
+    }
+    return ok;
 #endif
 }
 
 void os_release(uint8_t * p, size_t size) {
+    os_timer timer;
+#if !defined(_WIN32)
+    if (LA_WIRE) {
+        munlock(p, size);
+    }
+#endif
 #if defined(_WIN32)
     VirtualFree(p, size, MEM_DECOMMIT);
 #elif defined(__APPLE__)
@@ -91,6 +126,34 @@ void os_release(uint8_t * p, size_t size) {
     if (!LA_GUARD) return;
 #endif
     mprotect(p, size, PROT_NONE);
+#endif
+}
+
+// Memory the system could give a program now, in bytes; 0 if unknown.
+uint64_t os_available() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPhys : 0;
+#elif defined(__APPLE__)
+    // free, inactive (file cache and pages not touched lately) and purgeable pages. Compressed pages
+    // are not counted: they are memory already taken.
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &n) != KERN_SUCCESS) return 0;
+    return ((uint64_t) vm.free_count + vm.inactive_count + vm.purgeable_count) * (uint64_t) vm_page_size;
+#elif defined(__linux__)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", (unsigned long long *) &kb) == 1) break;
+    }
+    fclose(f);
+    return kb * 1024;
+#else
+    return 0;
 #endif
 }
 
@@ -139,6 +202,10 @@ bool os_pread(la_fd fd, uint8_t * dst, size_t size, uint64_t offset) {
     return true;
 }
 #endif
+
+inline double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // ---- state ----------------------------------------------------------------
 
@@ -263,6 +330,22 @@ struct la_state {
     uint64_t pass_bytes0 = 0, pass_ahead0 = 0, pass_unused0 = 0, pass_reads0 = 0;
     uint64_t prefill_bytes = 0;
 
+    // Memory by observation (real mode, LA_HEADROOM_MB > 0). The resident share is set once at start,
+    // from the memory free then; other programs may want memory later. A watcher reads the memory the
+    // system has available every LA_HEADROOM_MS. Below the reserve it lowers the budgets of the layers
+    // and gives the coldest experts back at once; with room to spare again it raises them, never past
+    // the budgets of the start, and the experts come back as they are asked for. After Magnitude
+    // (design/inference/engine/memory.md), which keeps a reserve of the larger of 10% and 2 GiB.
+    uint64_t headroom = 0;              // bytes kept free for the system and other programs; 0 = off
+    int      headroom_ms = 100;
+    float    headroom_floor = 0.05f;    // a layer keeps at least this share of its starting budget
+    std::vector<int> cap0;              // the budgets at start
+    int      last_end_layer = -1;       // its experts may still be in use by its kernel
+    uint64_t headroom_low = UINT64_MAX; // least memory available seen
+    uint64_t headroom_given = 0, headroom_taken = 0;   // expert budgets lowered and raised again, in experts
+    std::thread headroom_thread;
+    std::atomic<bool> headroom_stop{false};
+
     la_state() {
         const char * e = getenv("LA_ENABLE");
         enabled = e && atoi(e) != 0;
@@ -292,6 +375,18 @@ struct la_state {
         if (const char * v = getenv("LA_PROFILE"))        profile_path = v;
         if (const char * v = getenv("LA_STATS"))          stats_path   = v;
         if (const char * v = getenv("LA_PROFILE_OUT"))    profile_out  = v;
+        if (const char * v = getenv("LA_HEADROOM_MB"))    headroom = (uint64_t) std::max(0.0, atof(v) * 1048576.0);
+        if (const char * v = getenv("LA_HEADROOM_MS"))    headroom_ms = std::max(10, atoi(v));
+        if (const char * v = getenv("LA_HEADROOM_FLOOR")) headroom_floor = std::min(1.0f, std::max(0.0f, (float) atof(v)));
+        if (headroom > 0 && real) {
+            if (os_available() == 0) {
+                fprintf(stderr, "moe-la: LA_HEADROOM_MB: this system does not say how much memory is available, off\n");
+                headroom = 0;
+            } else {
+                fprintf(stderr, "moe-la: keeping %.0f MiB available, checked every %d ms\n", headroom / 1048576.0, headroom_ms);
+                headroom_thread = std::thread([this] { watch_headroom(); });
+            }
+        }
         if (!profile_path.empty()) {
             if (FILE * f = fopen(profile_path.c_str(), "rb")) {
                 fseek(f, 0, SEEK_END);
@@ -315,6 +410,8 @@ struct la_state {
     }
 
     ~la_state() {
+        headroom_stop = true;
+        if (headroom_thread.joinable()) headroom_thread.join();
         report();
         {
             std::lock_guard<std::mutex> lock(io_mtx);
@@ -385,6 +482,13 @@ struct la_state {
                     read_bytes.load()/gib, read_wait_s, read_wait_s > 0 ? read_bytes.load()/gib/read_wait_s : 0.0,
                     (unsigned long long) evicted, prefill_bytes/gib, prefill_s);
             fprintf(stderr, "moe-la: at most %d experts over the budget at one time\n", peak_over);
+            fprintf(stderr, "moe-la: %.2f s in %llu page commits and releases (all threads)%s\n", g_os_ns.load() * 1e-9,
+                    (unsigned long long) g_os_calls.load(), LA_WIRE ? ", pages locked (LA_WIRE)" : "");
+            if (headroom > 0) fprintf(stderr, "moe-la: headroom: least available %.0f MiB; budgets lowered by %llu and raised by %llu experts\n",
+                                      headroom_low == UINT64_MAX ? 0.0 : headroom_low / 1048576.0,
+                                      (unsigned long long) headroom_given, (unsigned long long) headroom_taken);
+            if (g_wire_fail.load() > 0) fprintf(stderr, "moe-la: LA_WIRE: %llu locks failed (ulimit -l, or the system's wired limit)\n",
+                                                (unsigned long long) g_wire_fail.load());
             if (ahead_experts > 0) fprintf(stderr, "moe-la: read ahead %.2f GiB, %llu experts, %llu of them not used by the batch\n",
                                            ahead_bytes.load()/gib, (unsigned long long) ahead_experts, (unsigned long long) ahead_unused);
         }
@@ -663,6 +767,80 @@ struct la_state {
         }
     }
 
+    static size_t expert_bytes(const la_layer & L) {
+        size_t b = 0;
+        for (const auto & t : L.tensors) b += t.stride;
+        return b;
+    }
+
+    // LA_HEADROOM_MB: see headroom above. Budgets go down one expert per layer in turn, so every layer
+    // gives up the same share; a lower budget frees memory only in a layer that is full. The layer whose
+    // kernel may be running (the last one routed) is trimmed later, by ggml_moe_la_begin.
+    void watch_headroom() {
+        double last_say = 0;
+        while (!headroom_stop) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(headroom_ms));
+            const uint64_t avail = os_available();
+            if (avail == 0) continue;
+            std::lock_guard<std::mutex> lock(mtx);
+            headroom_low = std::min(headroom_low, avail);
+            if (layers.empty()) continue;
+            if (cap0.size() < layers.size()) cap0.resize(layers.size(), -1);
+            for (size_t l = 0; l < layers.size(); ++l) {
+                if (layers[l] && cap0[l] < 0) cap0[l] = layers[l]->cap;
+            }
+            const uint64_t margin = std::max<uint64_t>(headroom / 2, (uint64_t) 512 << 20);
+            int changed = 0;
+            uint64_t bytes = 0;
+            if (avail < headroom) {
+                int64_t need = (int64_t) (headroom - avail);
+                for (bool any = true; need > 0 && any; ) {
+                    any = false;
+                    for (size_t l = 0; l < layers.size() && need > 0; ++l) {
+                        la_layer * L = layers[l].get();
+                        if (!L || L->tensors.empty() || L->cap <= (int) std::ceil(headroom_floor * cap0[l])) continue;
+                        L->cap--;
+                        changed++;
+                        any = true;
+                        if (L->n_resident > L->cap) {
+                            need  -= (int64_t) expert_bytes(*L);
+                            bytes += expert_bytes(*L);
+                        }
+                    }
+                }
+                for (size_t l = 0; l < layers.size(); ++l) {
+                    if (layers[l] && (int) l != last_end_layer) trim(*layers[l]);
+                }
+                headroom_given += changed;
+            } else if (avail > headroom + margin) {
+                // at most 256 MiB of budget a check, and never more than the room above the margin
+                int64_t room = (int64_t) std::min<uint64_t>(avail - headroom - margin, (uint64_t) 256 << 20);
+                for (bool any = true; room > 0 && any; ) {
+                    any = false;
+                    for (size_t l = 0; l < layers.size() && room > 0; ++l) {
+                        la_layer * L = layers[l].get();
+                        if (!L || L->tensors.empty() || L->cap >= cap0[l]) continue;
+                        L->cap++;
+                        changed++;
+                        any = true;
+                        room  -= (int64_t) expert_bytes(*L);
+                        bytes += expert_bytes(*L);
+                    }
+                }
+                headroom_taken += changed;
+            }
+            if (changed > 0 && now_s() - last_say > 1.0) {
+                last_say = now_s();
+                int cap = 0, start = 0;
+                for (size_t l = 0; l < layers.size(); ++l) {
+                    if (layers[l] && !layers[l]->tensors.empty()) { cap += layers[l]->cap; start += cap0[l]; }
+                }
+                fprintf(stderr, "moe-la: %.0f MiB available: expert budget %s by %.0f MiB, now %d of %d experts\n",
+                        avail / 1048576.0, avail < headroom ? "lowered" : "raised", bytes / 1048576.0, cap, start);
+            }
+        }
+    }
+
     // The slots follow the use of the model. The expert without a slot that is asked for most takes the
     // slot of the slot expert that is asked for least, when the difference is clear. In real mode the
     // two change places: the one going out is copied from the GPU into the memory the one coming in
@@ -720,10 +898,6 @@ struct la_state {
 la_state & state() {
     static la_state s;
     return s;
-}
-
-inline double now_s() {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 } // namespace
@@ -934,6 +1108,7 @@ void ggml_moe_la_end(int layer) {
     std::lock_guard<std::mutex> lock(s.mtx);
     if ((int) s.layers.size() <= layer || !s.layers[layer]) return;
     la_layer & L = *s.layers[layer];
+    s.last_end_layer = layer;
     const int n_tokens = (int) (L.clock + 1 - L.run_start);
     if (s.real) {
         // Room for what the run reads is made here, when everything the run uses is known: an expert

@@ -44,6 +44,17 @@ costs speed in real mode), `LA_STATS=file` (append one JSON line of counters at 
 price of one memory mapping per expert range, which a model with more than about 60,000 ranges
 cannot afford).
 
+Memory (real mode; added 2026-10-14 after Magnitude's memory design, not yet measured):
+
+| variable | meaning |
+|---|---|
+| `LA_HEADROOM_MB=2048` | off by default. Keep this much memory available to the system. A watcher reads the available memory every `LA_HEADROOM_MS` (100); below the reserve it lowers the experts' budget, one expert per layer in turn, and gives the coldest back at once; with half the reserve (at least 512 MiB) to spare again it raises it, at most 256 MiB a check and never past the budget of the start. The experts come back as they are asked for. A layer keeps at least `LA_HEADROOM_FLOOR` (0.05) of its starting budget. The layer whose kernel may be running is trimmed at its next turn. Available memory: Windows `ullAvailPhys`, Linux `MemAvailable`, macOS free + inactive + purgeable pages |
+| `LA_WIRE=1` | off by default; not on Windows. Lock the pages of resident experts (`mlock`) so the system cannot compress or swap them. Written for macOS, where the CPU-only real cache generated at 0.04 tok/s (0.31 stock) on the 8 GB M1 without explanation. A lock that fails is counted and reported (Linux allows 8 MiB by default, `ulimit -l`) |
+
+The end-of-run lines now also give the time spent in page commits and releases (one system call per
+expert read or evicted, all threads together), and with `LA_HEADROOM_MB` the least memory available
+seen and how many experts the budgets were lowered and raised by.
+
 ## The lookup table (`--defer-ple`)
 
 A token needs 16 rows of the table of Qwen3.8-Flash-Next, each a page of the file. Pages used before
