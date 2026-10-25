@@ -2540,9 +2540,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * logits,
             int                   layer);
+    // w: the unbiased gating values when a is biased for selection (null otherwise); LA_WCAP measures with them
     GGML_API struct ggml_tensor * ggml_moe_la_topk(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
             int                   k,
             int                   layer);
     GGML_API struct ggml_tensor * ggml_grouped_topk(

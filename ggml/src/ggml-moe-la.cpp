@@ -256,6 +256,7 @@ struct la_state {
     float  gamma     = 0.0f;    // multiplicative bias: a non-resident expert competes with p * exp(-gamma)
     int    prefetch  = 0;       // experts per token read ahead for the next layer
     int    protect   = 0;       // the router's first `protect` experts are always served
+    float  wcap      = 0.0f;    // > 0: substitute only while the routing weight given up stays under this share
     float  theta     = 0.0f;
     float  price_res = 0.1f;
     float  gpu_frac  = 0.0f;
@@ -356,6 +357,7 @@ struct la_state {
         if (const char * v = getenv("LA_GAMMA"))          gamma     = (float) atof(v);
         if (const char * v = getenv("LA_PREFETCH"))       prefetch  = atoi(v);
         if (const char * v = getenv("LA_PROTECT"))        protect   = atoi(v);
+        if (const char * v = getenv("LA_WCAP"))           wcap      = std::min(1.0f, std::max(0.0f, (float) atof(v)));
         if (const char * v = getenv("LA_THETA"))          theta     = (float) atof(v);
         if (const char * v = getenv("LA_PRICE_RESIDENT")) price_res = (float) atof(v);
         if (const char * v = getenv("LA_GPU_FRAC"))       gpu_frac  = (float) atof(v);
@@ -403,7 +405,8 @@ struct la_state {
             gpu_frac = 0;
         }
         if (gpu_frac > 0) fprintf(stderr, "moe-la: VRAM tier, gpu_frac=%g excess_ram=%g\n", (double) gpu_frac, (double) excess_ram);
-        fprintf(stderr, "moe-la: gamma=%g protect=%d\n", (double) gamma, protect);
+        fprintf(stderr, "moe-la: gamma=%g protect=%d wcap=%g%s\n", (double) gamma, protect, (double) wcap,
+                wcap > 0 && (beta > 0 || gamma > 0) ? " (wcap replaces beta and gamma)" : "");
         fprintf(stderr, "moe-la: enabled (%s), resident_frac=%g beta=%g theta=%g price_resident=%g profile=%s\n",
                 real ? "real" : "modelled", (double) frac, (double) beta, (double) theta, (double) price_res,
                 profile.empty() ? "(none)" : profile_path.c_str());
@@ -495,12 +498,12 @@ struct la_state {
         write_profile(true);
         if (!stats_path.empty()) {
             if (FILE * f = fopen(stats_path.c_str(), "a")) {
-                fprintf(f, "{\"real\":%d,\"resident_frac\":%g,\"beta\":%g,\"theta\":%g,\"price_resident\":%g,"
+                fprintf(f, "{\"real\":%d,\"resident_frac\":%g,\"beta\":%g,\"wcap\":%g,\"theta\":%g,\"price_resident\":%g,"
                            "\"events\":%llu,\"served\":%llu,\"reads\":%llu,\"exact_reads\":%llu,\"substituted\":%llu,"
                            "\"dropped\":%llu,\"evicted\":%llu,\"read_bytes\":%llu,\"read_wait_s\":%.4f,"
                            "\"prefill_bytes\":%llu,\"prefill_s\":%.4f,\"async\":%d,\"bg_requested\":%llu,"
                            "\"bg_admitted\":%llu,\"bg_skipped\":%llu,\"bg_bytes\":%llu,\"gpu_served\":%llu}\n",
-                        real ? 1 : 0, (double) frac, (double) beta, (double) theta, (double) price_res,
+                        real ? 1 : 0, (double) frac, (double) beta, (double) wcap, (double) theta, (double) price_res,
                         (unsigned long long) events, (unsigned long long) served, (unsigned long long) reads,
                         (unsigned long long) exact_reads, (unsigned long long) substituted,
                         (unsigned long long) dropped, (unsigned long long) evicted,
@@ -988,7 +991,7 @@ void ggml_moe_la_begin(int layer) {
     L.pending.clear();
 }
 
-void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int32_t * ids) {
+void ggml_moe_la_select(int layer, const float * probs, const float * weights, int n_expert, int k, int32_t * ids) {
     la_state & s = state();
     std::lock_guard<std::mutex> lock(s.mtx);
     la_layer & L = s.get(layer, n_expert);
@@ -1014,7 +1017,66 @@ void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int
     for (int j = 0; j < kk; ++j) wanted[j] = idx[j];
 
     int picked[64];
-    if (s.beta > 0 || s.gamma > 0) {
+    if (s.wcap > 0) {
+        // Weight cap: an expert that is in neither RAM nor VRAM may be swapped for the most probable
+        // expert that is, cheapest first, while the share of the top-k routing weight given up stays
+        // within wcap. The share is a property of the output, so one value means the same on any model.
+        // Measured with the mixing weights: with a selection bias (sigmoid routers with exp_probs_b) the
+        // selection scores say little about how much of the output an expert carries.
+        auto in_mem = [&](int e) { return L.resident[e] || L.gpu_slot[e] >= 0; };
+        const float * wt = weights ? weights : probs;
+        float wsum = 0.0f;
+        for (int j = 0; j < kk; ++j) wsum += wt[wanted[j]];
+        wsum = std::max(wsum, 1e-12f);
+        memcpy(picked, wanted, sizeof(int) * kk);
+        // candidates: experts in memory and not wanted, most probable first (idx[kk..] is unsorted)
+        static thread_local std::vector<int> cand;
+        cand.clear();
+        for (int j = kk; j < n_expert; ++j) if (in_mem(idx[j])) cand.push_back(idx[j]);
+        std::sort(cand.begin(), cand.end(), [&](int a, int b) { return probs[a] > probs[b] || (probs[a] == probs[b] && a < b); });
+        // The cost of a set of swaps is how far the mix moves: the total-variation distance between the
+        // wanted experts' weights and the served experts' weights, each normalized to sum 1 (the model
+        // renormalizes over what it serves). It counts what is given up, what is brought in (a sigmoid
+        // router's substitute may weigh more than what it replaces) and the rescaling of the rest.
+        auto tv = [&](const int * set) {
+            float w2 = 0.0f;
+            for (int j = 0; j < kk; ++j) w2 += wt[set[j]];
+            w2 = std::max(w2, 1e-12f);
+            float d = 0.0f;
+            for (int j = 0; j < kk; ++j) {          // wanted experts: kept (rescaled) or given up
+                bool kept = false;
+                for (int i = 0; i < kk; ++i) kept |= (set[i] == wanted[j]);
+                const float w = wt[wanted[j]];
+                d += kept ? fabsf(w / wsum - w / w2) : w / wsum;
+            }
+            for (int i = 0; i < kk; ++i) {          // brought in
+                bool was = false;
+                for (int j = 0; j < kk; ++j) was |= (set[i] == wanted[j]);
+                if (!was) d += wt[set[i]] / w2;
+            }
+            return 0.5f * d;
+        };
+        // wanted and missing, cheapest by weight first; the router's first `protect` are never given up.
+        // Each takes the most probable candidate whose swap keeps the distance within wcap.
+        int order[64], n_order = 0;
+        for (int j = std::min(s.protect, kk); j < kk; ++j) if (!in_mem(wanted[j])) order[n_order++] = j;
+        std::sort(order, order + n_order, [&](int a, int b) { return wt[wanted[a]] < wt[wanted[b]]; });
+        static thread_local std::vector<char> used;
+        used.assign(cand.size(), 0);
+        for (int o = 0; o < n_order; ++o) {
+            const int j = order[o];
+            if (wt[wanted[j]] / wsum > s.wcap) break;   // giving it up alone is already too much
+            for (size_t c = 0; c < cand.size(); ++c) {
+                if (used[c]) continue;
+                const int keep = picked[j];
+                picked[j] = cand[c];
+                if (tv(picked) <= s.wcap) { used[c] = 1; break; }
+                picked[j] = keep;
+            }
+        }
+        std::sort(picked, picked + kk,
+                  [&](int a, int b) { return probs[a] > probs[b] || (probs[a] == probs[b] && a < b); });
+    } else if (s.beta > 0 || s.gamma > 0) {
         const float rng = std::max(probs[wanted[0]] - probs[wanted[kk - 1]], 1e-12f);
         adj.resize(n_expert);
         for (int e = 0; e < n_expert; ++e) {

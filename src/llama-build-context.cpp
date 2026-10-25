@@ -1607,7 +1607,9 @@ llm_expert_gating_func_type   gating_op,
             //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
             //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
             if (lctx.model.la_owner && ggml_moe_la_active() && n_expert_used < n_expert) {
-                selected_experts = ggml_moe_la_topk(ctx, selection_probs, n_expert_used, il);
+                // with a selection bias the mixing weights are the unbiased probs; the weight cap measures with them
+                selected_experts = ggml_moe_la_topk(ctx, selection_probs, selection_probs != probs ? probs : nullptr,
+                                                    n_expert_used, il);
             } else {
                 selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
             }

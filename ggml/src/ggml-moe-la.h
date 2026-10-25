@@ -81,8 +81,9 @@ void ggml_moe_la_prefill(void);
 void ggml_moe_la_begin(int layer);
 // probs: n_expert router probabilities. ids: n_expert entries out; the
 // selection comes first (most probable first), every other entry is -1.
-// At most k experts are selected, at least one.
-void ggml_moe_la_select(int layer, const float * probs, int n_expert, int k, int32_t * ids);
+// At most k experts are selected, at least one. weights: the gating values the experts are mixed
+// with when they differ from probs (a router with a selection bias), else null.
+void ggml_moe_la_select(int layer, const float * probs, const float * weights, int n_expert, int k, int32_t * ids);
 void ggml_moe_la_end(int layer);
 
 // True if a graph for n_tokens tokens should carry the guess for the next layer.

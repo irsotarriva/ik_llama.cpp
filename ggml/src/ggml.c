@@ -11018,10 +11018,15 @@ struct ggml_tensor * ggml_moe_la_prefetch_op(
 struct ggml_tensor * ggml_moe_la_topk(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
         int                   k,
         int                   layer) {
     GGML_ASSERT(a->ne[0] >= k);
     struct ggml_tensor * result = ggml_argsort_thresh(ctx, a, 1, 0.0f);
+    if (w) {
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_are_same_shape(a, w) && w->nb[0] == sizeof(float));
+        result->src[1] = w;
+    }
     ggml_set_op_params_i32(result, 2, (int32_t) k);
     ggml_set_op_params_i32(result, 3, (int32_t) layer);
     result = ggml_view_4d(ctx, result,
@@ -23365,9 +23370,11 @@ static void ggml_compute_forward_argsort_thresh_f32(
         // stateful (it tracks residency), so one thread walks the tokens in order
         if (ith != 0) return;
         const int la_layer = ggml_get_op_params_i32(dst, 3);
+        const struct ggml_tensor * w = dst->src[1];
         ggml_moe_la_begin(la_layer);
         for (int64_t i = 0; i < nr; ++i) {
-            ggml_moe_la_select(la_layer, (const float *)((char *) src0->data + i*nb01), (int) ne0, la_k,
+            ggml_moe_la_select(la_layer, (const float *)((char *) src0->data + i*nb01),
+                               w ? (const float *)((const char *) w->data + i*w->nb[1]) : NULL, (int) ne0, la_k,
                                (int32_t *)((char *) dst->data + i*nb1));
         }
         ggml_moe_la_end(la_layer);
