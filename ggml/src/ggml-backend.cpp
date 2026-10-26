@@ -1365,6 +1365,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // only the CPU kernel knows about them (it tracks residency and reads experts in). A GPU backend
     // that implements plain ARGSORT_THRESH (CUDA does) would run its own argsort instead: the experts
     // are then never loaded and the CPU reads unbacked memory, or the helper's I32 input trips an assert.
+    // The fast path of the VRAM tier (-20 .. -25) is the other way round: its ops belong on the GPU, where
+    // the worker's mailbox is; the CPU has only a slow fallback for them.
+    if (tensor->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) tensor->op_params)[2] <= -20) {
+        for (int b = 0; b < sched->n_backends - 1; ++b) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.la-fast");
+                return b;
+            }
+        }
+        cur_backend_id = sched->n_backends - 1;
+        SET_CAUSE(tensor, "1.la-fast-cpu");
+        return cur_backend_id;
+    }
     if (tensor->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) tensor->op_params)[2] != 0) {
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.la");

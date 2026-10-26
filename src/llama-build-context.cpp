@@ -1596,10 +1596,21 @@ llm_expert_gating_func_type   gating_op,
         selection_probs = logits;
     }
 
+    // Load-aware VRAM tier, fast path: the selection and the slot ids on the GPU, the experts without a
+    // slot computed by the worker while the GPU runs the slots (ggml-moe-la.h, ggml-cuda/moe-la-fast.cu).
+    const bool grouped_routing = lctx.cparams.grouped_expert_routing &&
+            (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+    const bool la_fast = selected_experts == nullptr && !grouped_routing && graph &&
+        lctx.model.la_owner && ggml_moe_la_fast_active((int) n_tokens) &&
+        lctx.cparams.fused_mmad && lctx.cparams.fused_moe_up_gate &&
+        il >= 0 && il < (int) lctx.model.la_slots.size() && lctx.model.la_slots[il][0] &&
+        n_expert_used < n_expert && !weight_before_ffn && type_op == LLM_FFN_SILU &&
+        !up_gate_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !down_exps_s;
+
     // select experts
-    if (selected_experts == nullptr) {
-        const bool grouped_routing = lctx.cparams.grouped_expert_routing &&
-                (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+    if (selected_experts == nullptr && la_fast) {
+        selected_experts = ggml_moe_la_fast_select(ctx, selection_probs, (int) n_expert_used, il);
+    } else if (selected_experts == nullptr) {
         if (grouped_routing && n_tokens > 0) {
             auto& hparams = lctx.model.hparams;
             selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
@@ -1664,6 +1675,38 @@ llm_expert_gating_func_type   gating_op,
     }
 
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+
+    if (la_fast) {
+        const auto & slots = lctx.model.la_slots[il];
+        ggml_tensor * ids_g = ggml_moe_la_fast_map(ctx, selected_experts, 1, il);
+        ggml_tensor * mask  = ggml_moe_la_fast_map(ctx, selected_experts, 3, il);
+        ggml_tensor * x     = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx, cur);
+        ggml_tensor * w     = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx, weights);
+        // the worker starts here, before the slot experts are queued, so the two run at once
+        ggml_tensor * start = ggml_moe_la_fast_start(ctx, x, selected_experts, w, il);
+        cb(start, "la_fast_start", il);
+        ggml_build_forward_expand(graph, start);
+        ggml_tensor * par_g;
+        if (slots[0]->type == slots[1]->type) {
+            par_g = ggml_moe_up_gate(ctx, slots[1], slots[0], cur, ids_g, GGML_UNARY_OP_SILU);
+        } else {
+            ggml_tensor * gate_g = ggml_mul_mat_id(ctx, slots[0], cur, ids_g);
+            ggml_tensor * up_g   = ggml_mul_mat_id(ctx, slots[1], cur, ids_g);
+            par_g = ggml_fused_mul_unary(ctx, gate_g, up_g, GGML_UNARY_OP_SILU);
+        }
+        *((float *)(par_g->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+        ggml_tensor * exp_g = ggml_mul_mat_id(ctx, slots[2], par_g, ids_g);
+        cb(exp_g, "ffn_moe_down_gpu", il);
+        exp_g = ggml_mul(ctx, exp_g, mask);
+        ggml_tensor * out_g = ggml_mul_multi_add(ctx, exp_g, weights);
+        ggml_tensor * out   = ggml_moe_la_fast_collect(ctx, out_g, start, il);
+        cb(out, "ffn_moe_weighted", il);
+        if (add_input) {
+            out = ggml_add(ctx, out, input);
+            cb(out, "ffn_out_with_inp", il);
+        }
+        return out;
+    }
 
     // load-aware VRAM tier: experts that have a GPU slot run there, the others on the CPU
     ggml_tensor * sel_exec = selected_experts;

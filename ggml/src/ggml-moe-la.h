@@ -126,6 +126,47 @@ void ggml_moe_la_set_transit(int layer, struct ggml_tensor * gate, struct ggml_t
 void ggml_moe_la_transit(int layer, const int32_t * ids, int k, int n_tokens, size_t ids_stride,
                          const void * const src[3], const size_t stride[3], int32_t * out, size_t out_stride);
 
+// ---- VRAM tier, fast path (generation and small batches, LA_FAST) ----
+// When residency cannot change (modelled mode, every expert in a slot or in RAM, no LA_GPU_ADAPT,
+// no weight cap or theta), a layer needs no CPU decision between its GPU parts: the selection and the
+// slot ids are computed on the GPU, and the experts without a slot are computed by a worker thread
+// from a mailbox in mapped host memory, while the GPU runs the slot experts. One round trip per layer.
+bool ggml_moe_la_fast_ok(int n_tokens);
+int  ggml_moe_la_fast_max_tokens(void);
+// The layer's expert tensors in host memory (separate gate/up/down), for the worker.
+void ggml_moe_la_fast_register(int layer, struct ggml_tensor * gate, struct ggml_tensor * up,
+                               struct ggml_tensor * down, float swiglu_limit, bool fused_up_gate);
+// Tables for the GPU: slot[e] = the expert's slot or -1, excess[e] = 0 in a slot, LA_EXCESS_RAM in RAM,
+// 1 elsewhere. Returns the number of slots of the layer.
+int  ggml_moe_la_fast_tables(int layer, int n_expert, int32_t * slot, float * excess);
+void ggml_moe_la_fast_params(float * beta, float * gamma, int * protect);
+// The same selection as ggml_moe_la_select without its side effects, for one token (CPU fallback and
+// reference for the CUDA kernel): ids gets k experts, most probable first.
+void ggml_moe_la_fast_pick(const float * probs, int n_expert, int k, const int32_t * slot, const float * excess,
+                           float beta, float gamma, int protect, int32_t * ids);
+
+// The mailbox. Written by the GPU (start), read by the worker; out written by the worker, read by the
+// GPU (collect). seq numbers tell a new job from an old one.
+struct ggml_moe_la_mailbox {
+    volatile int32_t start_seq;
+    volatile int32_t layer;
+    volatile int32_t n_tokens;
+    volatile int32_t k;
+    volatile int32_t n_embd;
+    volatile int32_t done_seq;
+    volatile int32_t error;
+    int32_t pad[9];
+    // followed by float x[max_tokens*n_embd], int32 ids[max_tokens*k], float w[max_tokens*k],
+    // float out[max_tokens*n_embd], at the offsets ggml_moe_la_mailbox_layout gives
+};
+size_t ggml_moe_la_mailbox_layout(int n_embd, int k, int max_tokens, size_t * off_x, size_t * off_ids,
+                                  size_t * off_w, size_t * off_out);
+// The CUDA side made a mailbox in mapped host memory: the worker starts watching it.
+void ggml_moe_la_fast_attach(struct ggml_moe_la_mailbox * mb, int n_embd, int k, int max_tokens);
+// Compute one job synchronously from host buffers (the CPU fallback of the start op).
+void ggml_moe_la_fast_compute(int layer, int n_tokens, int k, int n_embd, const float * x, const int32_t * ids,
+                              const float * w, float * out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5541,7 +5541,16 @@ static bool llm_load_tensors(
                     strides[j] = stride;
                 }
                 ggml_moe_la_gpu_slot_tensors(il, model.la_slots[il].data(), host, strides);
+                // the fast path's worker computes this layer's other experts from the host tensors
+                ggml_moe_la_fast_layer(il, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps,
+                                       model.swiglu_limit(il, false), true);
             }
+#ifdef GGML_USE_CUDA
+            if (ggml_moe_la_fast_active(1)) {
+                ggml_cuda_la_fast_prepare(gpu_id, n_la_layers, (int) model.hparams.n_expert, (int) model.hparams.n_embd,
+                                          (int) model.hparams.n_expert_used, ggml_moe_la_fast_max());
+            }
+#endif
             LLAMA_LOG_INFO("%s: load-aware VRAM tier: %zu experts in GPU slots (%.1f MiB)\n", __func__, n_slots,
                     ggml_backend_buffer_get_size(sbuf)/1024.0/1024.0);
         }

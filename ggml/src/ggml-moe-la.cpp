@@ -1418,3 +1418,5 @@ bool ggml_moe_la_owns(const void * data) {
     if (!s.enabled || !s.real || !data) return false;
     return std::find(s.owned.begin(), s.owned.end(), data) != s.owned.end();
 }
+
+#include "ggml-moe-la-fast.inc"

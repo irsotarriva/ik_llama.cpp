@@ -64,6 +64,7 @@
 #include "ggml-cuda/blend.cuh"
 #include "ggml-cuda/indexer_topk.cuh"
 #include "ggml-cuda/ds4_comp.cuh"
+#include "ggml-cuda/moe-la-fast.cuh"
 
 #include <algorithm>
 #include <array>
@@ -4241,7 +4242,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             }
             break;
         case GGML_OP_ARGSORT_THRESH:
-            ggml_cuda_op_argsort_thresh(ctx, dst);
+            if (dst->op_params[2] <= -20) {
+                ggml_cuda_op_moe_la_fast(ctx, dst);   // load-aware VRAM tier, fast path
+            } else {
+                ggml_cuda_op_argsort_thresh(ctx, dst);
+            }
             break;
         case GGML_OP_GROUPED_TOPK:
             ggml_cuda_op_grouped_topk(ctx, dst);
@@ -5131,6 +5136,9 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_ARGSORT:
             return true;
         case GGML_OP_ARGSORT_THRESH:
+            if (op->op_params[2] <= -20) {
+                return ggml_cuda_la_fast_ready(cuda_ctx->device);   // load-aware VRAM tier, fast path
+            }
             // The CUDA bitonic argsort launches one thread per (padded) column, so the
             // row width rounded up to a power of 2 must fit in a single CUDA block (<=1024
             // threads). Wider rows (e.g. the DSA lightning-indexer scoring over a large

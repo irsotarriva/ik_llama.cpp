@@ -2534,6 +2534,23 @@ extern "C" {
             struct ggml_tensor  * ids,
             int                   kind,
             int                   layer);
+    // VRAM tier, fast path (see ggml-moe-la.h): selection and slot ids on the GPU, the experts without a
+    // slot computed by a worker while the GPU runs the slots. The ops are ARGSORT_THRESH nodes with
+    // op_params[2] = -20 .. -25; CUDA runs them, the CPU has a slow fallback.
+    GGML_API bool ggml_moe_la_fast_active(int n_tokens);
+    GGML_API int  ggml_moe_la_fast_max(void);   // largest batch that takes the fast path (LA_FAST_MAX)
+    GGML_API void ggml_moe_la_fast_layer(int layer, struct ggml_tensor * gate, struct ggml_tensor * up,
+                                         struct ggml_tensor * down, float swiglu_limit, bool fused_up_gate);
+    // probs [n_expert, n_tokens] -> ids [k, n_tokens], most probable first
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_select(struct ggml_context * ctx, struct ggml_tensor * probs, int k, int layer);
+    // kind 1: slot ids of the GPU side (I32 [k, n]); kind 3: its mask (F32 [1, k, n]), as ggml_moe_la_aux_op
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_map(struct ggml_context * ctx, struct ggml_tensor * ids, int kind, int layer);
+    // hands the experts without a slot to the worker; cur [n_embd, 1, n_tokens], weights [1, k, n_tokens]
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_start(struct ggml_context * ctx, struct ggml_tensor * cur,
+                                                         struct ggml_tensor * ids, struct ggml_tensor * weights, int layer);
+    // gpu_out [n_embd, n_tokens] plus what the worker computed for `start`
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_collect(struct ggml_context * ctx, struct ggml_tensor * gpu_out,
+                                                           struct ggml_tensor * start, int layer);
     // read-ahead (LA_PREFETCH): logits = the router of `layer` applied to the previous layer's input
     GGML_API bool ggml_moe_la_prefetch_active(int n_tokens);
     GGML_API struct ggml_tensor * ggml_moe_la_prefetch_op(

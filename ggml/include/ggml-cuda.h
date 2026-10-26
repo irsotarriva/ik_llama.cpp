@@ -46,6 +46,10 @@ GGML_API GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log
 GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
 
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
+
+// Load-aware VRAM tier, fast path: the mailbox in mapped host memory and the per-layer tables on
+// `device`, made once at load after the slots (see ggml-moe-la.h). Starts the worker.
+GGML_API void ggml_cuda_la_fast_prepare(int device, int n_layers, int n_expert, int n_embd, int k, int max_tokens);
 #ifdef  __cplusplus
 }
 #endif
