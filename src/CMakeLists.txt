@@ -56,6 +56,8 @@ add_library(llama
             llama-model.cpp
             llama-reload-info.h
             llama-reload.cpp
+            llama-la-recipe.h
+            llama-la-recipe.cpp
             llama-quantize.cpp
             llama-arch.h
             llama-arch.cpp

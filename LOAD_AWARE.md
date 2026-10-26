@@ -7,6 +7,10 @@ is switched with environment variables, read once at start by `llama-cli`, `llam
 
 Measurements behind the advice here are in the project log, `I:\localAIOptimization\RESULTS.md`.
 
+Measured settings per model family are kept as recipes: `LA_RECIPES=F:/ik_llama_la/recipes` sets
+them from the model's metadata, `LA_RECIPE_LEVEL=exact|near|balanced|fast` picks how much quality
+they may give up, and any variable set by hand wins (`recipes/README.md`).
+
 ## The settings that matter
 
 | variable | meaning |

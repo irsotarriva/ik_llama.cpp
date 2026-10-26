@@ -1,0 +1,25 @@
+# Qwen3.6-35B-A3B and its finetunes (measured: Qwen3.6 UD-Q4_K_M, Dark-Scarlett Q4_0).
+# Written by localAIOptimization/tools/make_recipes.py on 2026-10-26 from
+# results/cross_model.csv and cross_model_wcap.csv (RESULTS.md, 2026-10-25). A level allows
+# that much KL above exact routing on every model measured, at 15% and 40% resident;
+# 'saved' is the share of exact routing's disk reads avoided, worst case.
+match arch=qwen35moe n_expert=256
+default balanced
+LA_ENABLE=1
+LA_PROFILE=profiles/qwen3.6-35b-a3b.f32
+
+[exact]
+# KL budget 0: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[near]
+# KL budget 0.005: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[balanced]
+# KL budget 0.02: +0.0195 KL, 54% of reads saved (worst case); at 40% resident +0.0124, 79%
+LA_WCAP=0.2
+
+[fast]
+# KL budget 0.1: +0.0782 KL, 87% of reads saved (worst case); at 40% resident +0.0305, 96%
+LA_BETA=1

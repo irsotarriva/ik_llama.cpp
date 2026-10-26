@@ -30,6 +30,7 @@
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
 #include "llama-quantize.h"
+#include "llama-la-recipe.h"
 
 #include "unicode.h"
 
@@ -5745,6 +5746,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         }
 
         llm_load_print_meta(ml, model);
+
+        // before any tensor is loaded: the selector reads its LA_* settings at the first expert tensor
+        if (!params.vocab_only) llama_la_apply_recipe(model, fname);
 
         if (model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE &&
             model.hparams.n_vocab != model.vocab.n_tokens()) {
