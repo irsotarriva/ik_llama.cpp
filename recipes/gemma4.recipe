@@ -1,7 +1,6 @@
 # Gemma4-26B-A4B (measured: the Omega-Evolution finetune, Q4_K_M). Its CPU and GPU paths
 # differ by KL 0.08 on their own; the levels count only what the selector adds.
-# Written by localAIOptimization/tools/make_recipes.py on 2026-10-26 from
-# results/cross_model.csv and cross_model_wcap.csv (RESULTS.md, 2026-10-25). A level allows
+# Generated on 2026-10-26 from measured quality grids (see README.md). A level allows
 # that much KL above exact routing on every model measured, at 15% and 40% resident;
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match arch=gemma4 n_expert=128

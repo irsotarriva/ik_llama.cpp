@@ -3,7 +3,7 @@
 Measured selector settings per model family, so a result can be reproduced without remembering
 which variables it took. Turn them on with
 
-    LA_RECIPES=F:/ik_llama_la/recipes llama-server -m model.gguf ...
+    LA_RECIPES=path/to/recipes llama-server -m model.gguf ...
 
 At load the engine reads every `*.recipe` here, takes the one that matches the model best (the most
 `match` keys that hold; `default.recipe` matches anything) and sets its variables. It prints what
@@ -45,10 +45,10 @@ no read-ahead, the way it generates; its base is exact routing on that same path
 
 ## Making and changing them
 
-The recipes are written by `localAIOptimization/tools/make_recipes.py` from the measured grids
-(`tools/cross_model.py`; `RESULTS.md`, 2026-10-25). Edit the budgets or families there and run it
-again; it also copies each family's usage profile to `profiles/`. A new model: run
-`cross_model.py --models NAME` (both grids), add a family, rerun.
+The recipes come from measured grids of quality (KL divergence against exact routing) and disk
+reads saved, per setting and model. The scripts that produce them are not part of this repository
+yet. To add a model by hand: copy a recipe, change its `match` keys, and record a usage profile
+with `LA_PROFILE_OUT`.
 
 The profile in a family recipe comes from its reference model; a finetune routes much the same, but
 its own profile (`LA_PROFILE_OUT`) is better and, given by hand, wins.

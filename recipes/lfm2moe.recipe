@@ -1,7 +1,6 @@
 # LFM2-24B-A2B (measured: Q4_K_M). Every swap costs this model much more than Qwen:
 # keep it exact and get the speed from memory (LA_RESIDENT_FRAC, LA_GPU_FRAC).
-# Written by localAIOptimization/tools/make_recipes.py on 2026-10-26 from
-# results/cross_model.csv and cross_model_wcap.csv (RESULTS.md, 2026-10-25). A level allows
+# Generated on 2026-10-26 from measured quality grids (see README.md). A level allows
 # that much KL above exact routing on every model measured, at 15% and 40% resident;
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match arch=lfm2moe n_expert=64

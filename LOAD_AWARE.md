@@ -1,13 +1,11 @@
 # Load-aware expert cache: settings
 
-This fork of ik_llama.cpp (branch `load-aware`) can keep only part of a mixture-of-experts model's
+This fork of ik_llama.cpp can keep only part of a mixture-of-experts model's
 routed experts in memory and read the others from the GGUF when the router asks for them. Everything
 is switched with environment variables, read once at start by `llama-cli`, `llama-server` and
 `llama-perplexity`. Without `LA_ENABLE=1` the engine behaves as upstream.
 
-Measurements behind the advice here are in the project log, `I:\localAIOptimization\RESULTS.md`.
-
-Measured settings per model family are kept as recipes: `LA_RECIPES=F:/ik_llama_la/recipes` sets
+Measured settings per model family are kept as recipes: `LA_RECIPES=path/to/recipes` sets
 them from the model's metadata, `LA_RECIPE_LEVEL=exact|near|balanced|fast` picks how much quality
 they may give up, and any variable set by hand wins (`recipes/README.md`).
 
@@ -20,7 +18,7 @@ they may give up, and any variable set by hand wins (`recipes/README.md`).
 | `LA_RESIDENT_FRAC=0.58` | share of the routed experts kept in RAM (0 to 1) |
 | `LA_BETA=0.25` | bias toward resident experts, in units of the router's top-k probability range. 0 = exactly what the router asks for. Most of the speed is won by 0.25; quality collapses between 1.0 and 1.5 on both models tried |
 | `LA_PROTECT=2` | always serve the router's first N experts, whatever the bias. With `LA_PROTECT=2 LA_BETA=4` every other miss is substituted and there is no cliff |
-| `LA_WCAP=0.2` | instead of `LA_BETA`: a token swaps experts that are not in memory for ones that are while its mix of experts moves by at most this share (total-variation distance of the normalized weights). Same frontier as the bias on Qwen3.6, better on Gemma4 up to half the reads saved; the quality cost of a value still differs between models (`RESULTS.md`, 2026-10-25) |
+| `LA_WCAP=0.2` | instead of `LA_BETA`: a token swaps experts that are not in memory for ones that are while its mix of experts moves by at most this share (total-variation distance of the normalized weights). Same frontier as the bias on Qwen3.6, better on Gemma4 up to half the reads saved; the quality cost of a value still differs between models |
 | `LA_PROFILE=file` | usage profile: which experts to load before the first token. Without one the cache starts empty |
 | `LA_PROFILE_OUT=file` | write the profile of this run (one float per layer and expert). Rewritten every 512 tokens and at exit. If `LA_PROFILE` is also given, the old profile counts as 4,096 tokens of earlier use, so the same path for both keeps a running profile |
 | `LA_GPU_FRAC=0.5` | share of the experts copied into VRAM slots and run on the GPU (needs a profile and a GPU build; dense layers with `-ngl 99 -ot exps=CPU`) |

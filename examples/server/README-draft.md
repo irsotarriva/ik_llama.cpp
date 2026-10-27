@@ -65,6 +65,5 @@ the unfinished word itself.
 - Do not send a draft while the answer to the last message is still being generated.
 - One draft at a time: wait for the answer to a draft before sending the next, and send the real
   request whenever the user sends, without waiting.
-- Measured on a Ryzen 7 5800X with Qwen3.8-Flash-Next (see the project's `RESULTS.md`,
-  2026-10-13): a message of about 75 tokens waited 1.1 to 1.4 s for its first token after drafts,
+- Measured on a Ryzen 7 5800X with Qwen3.8-Flash-Next: a message of about 75 tokens waited 1.1 to 1.4 s for its first token after drafts,
   against 4 to 7 s sent in one piece; a question after a pasted text of 800 tokens waited 2 s.

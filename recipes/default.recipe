@@ -1,8 +1,7 @@
 # Any model without a recipe of its own: levels that held on every model measured.
 # No profile: the cache starts cold, and the VRAM tier needs one (make it with
 # LA_PROFILE_OUT, see LOAD_AWARE.md).
-# Written by localAIOptimization/tools/make_recipes.py on 2026-10-26 from
-# results/cross_model.csv and cross_model_wcap.csv (RESULTS.md, 2026-10-25). A level allows
+# Generated on 2026-10-26 from measured quality grids (see README.md). A level allows
 # that much KL above exact routing on every model measured, at 15% and 40% resident;
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match *
