@@ -1156,6 +1156,15 @@ int main(int argc, char ** argv) {
                     // Everything else, including multimodal completions.
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
+                if (inputs.size() == 1 && json_value(data, "draft", false)) {
+                    // the last tokens of a text that goes on may read differently once it does
+                    const int hold = std::max(0, json_value(data, "draft_hold_tokens", 1));
+                    inputs[0].keep_first((size_t) std::max(0, (int) inputs[0].size() - hold));
+                }
+                if (inputs.size() == 1 && data.contains("cache_breakpoints")) {
+                    json prompt_copy = prompt;      // `prompt` refers into `data`, which is changed here
+                    resolve_cache_breakpoints(llama_get_vocab(ctx_server.ctx), data, prompt_copy, inputs[0]);
+                }
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
@@ -2254,6 +2263,35 @@ int main(int argc, char ** argv) {
     svr->Post("/v1/embeddings",       handle_embeddings_oai);
     svr->Post("/v1/systemone",        handle_systemone);
     svr->Post("/tokenize",            handle_tokenize);
+    // states the clients asked to keep on disk (README-cache.md): list, extend, delete
+    svr->Get ("/cache", [&ctx_server](const httplib::Request &, httplib::Response & res) {
+        res.set_content(ctx_server.cache_store.list().dump(), "application/json; charset=utf-8");
+    });
+    svr->Post("/cache/extend", [&ctx_server](const httplib::Request & req, httplib::Response & res) {
+        json out = { {"ok", false} };
+        try {
+            const json body = json::parse(req.body);
+            server_cache_entry e;
+            const int64_t ttl = body.contains("ttl") ? server_cache_parse_ttl(body.at("ttl")) : 0;
+            if (ctx_server.cache_store.extend(json_value(body, "id", std::string()), ttl, e)) {
+                out = e.to_json();
+                out["ok"] = true;
+            }
+        } catch (const std::exception & err) {
+            out["error"] = err.what();
+        }
+        res.status = out.value("ok", false) ? 200 : 404;
+        res.set_content(out.dump(), "application/json; charset=utf-8");
+    });
+    svr->Post("/cache/delete", [&ctx_server](const httplib::Request & req, httplib::Response & res) {
+        bool ok = false;
+        try {
+            ok = ctx_server.cache_store.remove(json_value(json::parse(req.body), "id", std::string()));
+        } catch (const std::exception &) {
+        }
+        res.status = ok ? 200 : 404;
+        res.set_content(json{ {"ok", ok} }.dump(), "application/json; charset=utf-8");
+    });
     svr->Post("/detokenize",          handle_detokenize);
     svr->Post("/apply-template",      handle_apply_template);
     // LoRA adapters hotswap

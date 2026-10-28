@@ -395,6 +395,10 @@ enum ggml_metal_kernel_type {
     GGML_METAL_KERNEL_TYPE_CONCAT_F16,
     GGML_METAL_KERNEL_TYPE_SQR,
     GGML_METAL_KERNEL_TYPE_SUM_ROWS,
+    GGML_METAL_KERNEL_TYPE_SOFTPLUS,
+    GGML_METAL_KERNEL_TYPE_L2_NORM,
+    GGML_METAL_KERNEL_TYPE_SSM_CONV,
+    GGML_METAL_KERNEL_TYPE_DELTA_NET,
 
     GGML_METAL_KERNEL_TYPE_COUNT
 };
@@ -1065,6 +1069,10 @@ static struct ggml_backend_metal_context * ggml_metal_init(int n_cb) {
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_CONCAT_F16,                    concat_f16,                     true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SQR,                           sqr,                            true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SUM_ROWS,                      sum_rows,                       true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SOFTPLUS,                      softplus,                       true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_L2_NORM,                       l2_norm,                        ctx->support_simdgroup_reduction);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SSM_CONV,                      ssm_conv_f32,                   true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_DELTA_NET,                     delta_net_f32,                  ctx->support_simdgroup_reduction);
     }
 
     [metal_library release];
@@ -1140,6 +1148,17 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor * t, size_t * offs
 }
 
 static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx, const struct ggml_tensor * op) {
+    // debugging aid: GGML_METAL_NO_OPS=",MUL_MAT_ID,ARGSORT," sends those ops back to the CPU
+    {
+        static const char * no_ops = NULL;
+        static bool no_ops_read = false;
+        if (!no_ops_read) { no_ops = getenv("GGML_METAL_NO_OPS"); no_ops_read = true; }
+        if (no_ops) {
+            char key[64];
+            snprintf(key, sizeof(key), ",%s,", ggml_op_name(op->op));
+            if (strstr(no_ops, key)) return false;
+        }
+    }
 
     for (size_t i = 0, n = 3; i < n; ++i) {
         if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
@@ -1159,10 +1178,25 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_SWIGLU:
+                case GGML_UNARY_OP_SOFTPLUS:
                     return ggml_is_contiguous(op->src[0]);
                 default:
                     return false;
             }
+        // The linear-attention layers of Qwen3-Next, Qwen3.6 and Qwen3.8 (src/llama-delta-net.cpp). Without
+        // these every such layer leaves the GPU three times. GGML_METAL_NO_OPS=",DELTA_NET,SSM_CONV,L2_NORM,"
+        // sends them back to the CPU for comparison.
+        case GGML_OP_L2_NORM:
+            return ctx->support_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float);
+        case GGML_OP_SSM_CONV:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) && op->src[2]->nb[0] == sizeof(float) &&
+                   op->src[0]->nb[1] == op->src[0]->ne[0]*sizeof(float);
+        case GGML_OP_DELTA_NET:
+            // the scalar gate only (src3->ne[1] == 1); the per-channel gate (KDA) stays on the CPU
+            return ctx->support_simdgroup_reduction && op->src[3]->ne[1] == 1 &&
+                   op->src[2]->ne[0] == op->src[0]->ne[0] && op->src[0]->ne[0] % 32 == 0 && op->src[0]->ne[0] <= 128 &&
+                   ggml_is_contiguous(op->src[5]) && op->src[7] == NULL;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -1180,8 +1214,14 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
         case GGML_OP_SQR:
         case GGML_OP_SUM_ROWS:
             return true;
-        case GGML_OP_FUSED_MUL_UNARY:
-            return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FUSED_MUL_UNARY: {
+            // the kernels only cover the same-shape SILU/GELU/RELU form without a limit; the sigmoid
+            // gate and the one-gate-per-row form (shared expert, gated attention) must run on the CPU
+            const enum ggml_unary_op uop = (enum ggml_unary_op) op->op_params[0];
+            const float limit = *(const float *) (op->op_params + 1);
+            return ggml_is_contiguous(op->src[0]) && ggml_are_same_shape(op->src[0], op->src[1]) && limit < 1e-6f &&
+                   (uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_GELU || uop == GGML_UNARY_OP_RELU);
+        }
         case GGML_OP_SOFTCAP:
         case GGML_OP_SOFT_CAP_MAX:
             return true; //ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
@@ -1868,6 +1908,18 @@ static void ggml_metal_encode_node(
 
                     [encoder dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
                 } break;
+                case GGML_UNARY_OP_SOFTPLUS:
+                {
+                    id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_SOFTPLUS].pipeline;
+
+                    [encoder setComputePipelineState:pipeline];
+                    [encoder setBuffer:id_src0 offset:offs_src0 atIndex:0];
+                    [encoder setBuffer:id_dst  offset:offs_dst  atIndex:1];
+
+                    const int64_t n = ggml_nelements(dst);
+
+                    [encoder dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                } break;
                 case GGML_UNARY_OP_SWIGLU:
                 {
                     int64_t n = ggml_nelements(dst);
@@ -1934,6 +1986,121 @@ static void ggml_metal_encode_node(
                 const int64_t n = ggml_nelements(dst);
 
                 [encoder dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            } break;
+        case GGML_OP_L2_NORM:
+            {
+                float eps;
+                memcpy(&eps, dst->op_params, sizeof(float));
+
+                id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_L2_NORM].pipeline;
+
+                // one simdgroup per row
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:id_src0 offset:offs_src0 atIndex:0];
+                [encoder setBuffer:id_dst  offset:offs_dst  atIndex:1];
+                [encoder setBytes:&ne00 length:sizeof(ne00) atIndex:2];
+                [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:3];
+                [encoder setBytes:&nb02 length:sizeof(nb02) atIndex:4];
+                [encoder setBytes:&nb03 length:sizeof(nb03) atIndex:5];
+                [encoder setBytes:&nb1  length:sizeof(nb1)  atIndex:6];
+                [encoder setBytes:&nb2  length:sizeof(nb2)  atIndex:7];
+                [encoder setBytes:&nb3  length:sizeof(nb3)  atIndex:8];
+                [encoder setBytes:&eps  length:sizeof(eps)  atIndex:9];
+
+                [encoder dispatchThreadgroups:MTLSizeMake(ne01, ne02, ne03) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            } break;
+        case GGML_OP_SSM_CONV:
+            {
+                // src0: conv state {d_conv - 1, d_inner, n_kv}, src1: x {d_inner, n_tokens}, src2: weights {d_conv, d_inner},
+                // src3: sequence ids {n_kv, n_tokens} (i32), src4: per-step states (optional)
+                struct ggml_tensor * src3 = dst->src[3];
+                struct ggml_tensor * src4 = dst->src[4];
+                size_t offs_src3 = 0, offs_src4 = 0;
+                id<MTLBuffer> id_src3 = ggml_metal_get_buffer(src3, &offs_src3);
+                id<MTLBuffer> id_src4 = src4 ? ggml_metal_get_buffer(src4, &offs_src4) : id_dst;
+                if (!src4) offs_src4 = offs_dst;
+
+                const int32_t nc     = (int32_t) src2->ne[0];
+                const int32_t nr     = (int32_t) src0->ne[1];
+                const int32_t n_t    = (int32_t) src1->ne[1];
+                const int32_t n_kv   = (int32_t) src0->ne[2];
+                const int32_t save   = src4 != NULL;
+                const uint64_t nb31  = src3->nb[1];
+
+                id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_SSM_CONV].pipeline;
+
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:id_src0 offset:offs_src0 atIndex:0];
+                [encoder setBuffer:id_src1 offset:offs_src1 atIndex:1];
+                [encoder setBuffer:id_src2 offset:offs_src2 atIndex:2];
+                [encoder setBuffer:id_src3 offset:offs_src3 atIndex:3];
+                [encoder setBuffer:id_src4 offset:offs_src4 atIndex:4];
+                [encoder setBuffer:id_dst  offset:offs_dst  atIndex:5];
+                [encoder setBytes:&nc   length:sizeof(nc)   atIndex:6];
+                [encoder setBytes:&nr   length:sizeof(nr)   atIndex:7];
+                [encoder setBytes:&n_t  length:sizeof(n_t)  atIndex:8];
+                [encoder setBytes:&n_kv length:sizeof(n_kv) atIndex:9];
+                [encoder setBytes:&save length:sizeof(save) atIndex:10];
+                [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:11];
+                [encoder setBytes:&nb02 length:sizeof(nb02) atIndex:12];
+                [encoder setBytes:&nb10 length:sizeof(nb10) atIndex:13];
+                [encoder setBytes:&nb11 length:sizeof(nb11) atIndex:14];
+                [encoder setBytes:&nb21 length:sizeof(nb21) atIndex:15];
+                [encoder setBytes:&nb31 length:sizeof(nb31) atIndex:16];
+
+                // one thread per row of d_inner, every token in turn: the rows do not depend on each other
+                const int nth = 64;
+                [encoder dispatchThreadgroups:MTLSizeMake((nr + nth - 1)/nth, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+            } break;
+        case GGML_OP_DELTA_NET:
+            {
+                // see ggml_compute_forward_delta_net_f32 and iqk_fused_delta_net_impl, which this follows
+                struct ggml_tensor * src3 = dst->src[3];
+                struct ggml_tensor * src4 = dst->src[4];
+                struct ggml_tensor * src5 = dst->src[5];
+                struct ggml_tensor * src6 = dst->src[6];
+                size_t offs_src3 = 0, offs_src4 = 0, offs_src5 = 0, offs_src6 = 0;
+                id<MTLBuffer> id_src3 = ggml_metal_get_buffer(src3, &offs_src3);
+                id<MTLBuffer> id_src4 = ggml_metal_get_buffer(src4, &offs_src4);
+                id<MTLBuffer> id_src5 = ggml_metal_get_buffer(src5, &offs_src5);
+                id<MTLBuffer> id_src6 = src6 ? ggml_metal_get_buffer(src6, &offs_src6) : id_dst;
+                if (!src6) offs_src6 = offs_dst;
+
+                const int32_t head_dim  = (int32_t) src0->ne[0];
+                const int32_t n_tokens  = (int32_t) src0->ne[1];
+                const int32_t n_heads   = (int32_t) src2->ne[2];
+                const int32_t n_seqs    = (int32_t) src0->ne[3];
+                const int32_t gqa_ratio = (int32_t) (src2->ne[2]/src0->ne[2]);
+                const int32_t repeat    = dst->op_params[0];
+                const int32_t save      = src6 != NULL;
+                const uint64_t vnb1 = src2->nb[1]/sizeof(float);
+                const uint64_t vnb2 = src2->nb[2]/sizeof(float);
+                const uint64_t vnb3 = src2->nb[3]/sizeof(float);
+
+                id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_DELTA_NET].pipeline;
+
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:id_src0 offset:offs_src0 atIndex:0];
+                [encoder setBuffer:id_src1 offset:offs_src1 atIndex:1];
+                [encoder setBuffer:id_src2 offset:offs_src2 atIndex:2];
+                [encoder setBuffer:id_src3 offset:offs_src3 atIndex:3];
+                [encoder setBuffer:id_src4 offset:offs_src4 atIndex:4];
+                [encoder setBuffer:id_src5 offset:offs_src5 atIndex:5];
+                [encoder setBuffer:id_src6 offset:offs_src6 atIndex:6];
+                [encoder setBuffer:id_dst  offset:offs_dst  atIndex:7];
+                [encoder setBytes:&head_dim  length:sizeof(head_dim)  atIndex:8];
+                [encoder setBytes:&n_tokens  length:sizeof(n_tokens)  atIndex:9];
+                [encoder setBytes:&n_heads   length:sizeof(n_heads)   atIndex:10];
+                [encoder setBytes:&n_seqs    length:sizeof(n_seqs)    atIndex:11];
+                [encoder setBytes:&gqa_ratio length:sizeof(gqa_ratio) atIndex:12];
+                [encoder setBytes:&repeat    length:sizeof(repeat)    atIndex:13];
+                [encoder setBytes:&save      length:sizeof(save)      atIndex:14];
+                [encoder setBytes:&vnb1      length:sizeof(vnb1)      atIndex:15];
+                [encoder setBytes:&vnb2      length:sizeof(vnb2)      atIndex:16];
+                [encoder setBytes:&vnb3      length:sizeof(vnb3)      atIndex:17];
+
+                // a simdgroup per row of a head's state, four rows per threadgroup (as MLX's gated_delta_seq)
+                [encoder dispatchThreadgroups:MTLSizeMake(head_dim/4, n_heads, n_seqs) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             } break;
         case GGML_OP_SUM_ROWS:
             {

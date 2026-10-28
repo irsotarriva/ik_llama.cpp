@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-moe-la.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -11007,6 +11008,195 @@ struct ggml_tensor * ggml_top_k_thresh(
                    result->nb[1], result->nb[2], result->nb[3],
                 0);
 
+    return result;
+}
+
+// ggml_moe_la_topk
+
+uint64_t ggml_moe_la_mem_available(void) {
+    return ggml_moe_la_os_available();
+}
+
+uint64_t ggml_moe_la_mem_total(void) {
+    return ggml_moe_la_os_total();
+}
+
+bool ggml_moe_la_active(void) {
+    return ggml_moe_la_enabled();
+}
+
+bool ggml_moe_la_real_active(void) {
+    return ggml_moe_la_real();
+}
+
+bool ggml_moe_la_take_tensor(int layer, struct ggml_tensor * tensor, const char * path, uint64_t file_offset) {
+    return ggml_moe_la_register(layer, tensor, path, file_offset);
+}
+
+void ggml_moe_la_start(void) {
+    ggml_moe_la_prefill();
+}
+
+bool ggml_moe_la_gpu_active(void) {
+    return ggml_moe_la_gpu();
+}
+
+int ggml_moe_la_gpu_slots(int layer, int n_expert, int32_t * experts, int max_slots) {
+    return ggml_moe_la_gpu_plan(layer, n_expert, experts, max_slots);
+}
+
+void ggml_moe_la_gpu_drop(int layer) {
+    ggml_moe_la_gpu_cancel(layer);
+}
+
+struct ggml_tensor * ggml_moe_la_aux_op(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int                   kind,
+        int                   layer) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    struct ggml_tensor * result = (kind == 3 || kind == 6)
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ids->ne[0], ids->ne[1])
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 2, (int32_t) -kind);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result->op     = GGML_OP_ARGSORT_THRESH;
+    result->grad   = NULL;
+    result->src[0] = ids;
+    return result;
+}
+
+bool ggml_moe_la_gpu_plain(int n_tokens) {
+    return ggml_moe_la_batch_plain(n_tokens);
+}
+
+bool ggml_moe_la_fast_active(int n_tokens) {
+    return ggml_moe_la_fast_ok(n_tokens);
+}
+
+int ggml_moe_la_fast_max(void) {
+    return ggml_moe_la_fast_max_tokens();
+}
+
+void ggml_moe_la_fast_layer(int layer, struct ggml_tensor * gate, struct ggml_tensor * up,
+                            struct ggml_tensor * down, float swiglu_limit, bool fused_up_gate) {
+    ggml_moe_la_fast_register(layer, gate, up, down, swiglu_limit, fused_up_gate);
+}
+
+static struct ggml_tensor * ggml_moe_la_fast_node(struct ggml_context * ctx, struct ggml_tensor * result, int kind, int layer) {
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 2, (int32_t) -kind);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result->op   = GGML_OP_ARGSORT_THRESH;
+    result->grad = NULL;
+    (void) ctx;
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_la_fast_select(struct ggml_context * ctx, struct ggml_tensor * probs, int k, int layer) {
+    GGML_ASSERT(probs->type == GGML_TYPE_F32 && ggml_is_contiguous(probs) && probs->ne[0] >= k);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, ggml_nrows(probs));
+    result->src[0] = probs;
+    return ggml_moe_la_fast_node(ctx, result, 20, layer);
+}
+
+struct ggml_tensor * ggml_moe_la_fast_map(struct ggml_context * ctx, struct ggml_tensor * ids, int kind, int layer) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && (kind == 1 || kind == 3));
+    struct ggml_tensor * result = kind == 3
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ids->ne[0], ids->ne[1])
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+    result->src[0] = ids;
+    return ggml_moe_la_fast_node(ctx, result, 20 + kind, layer);
+}
+
+struct ggml_tensor * ggml_moe_la_fast_start(struct ggml_context * ctx, struct ggml_tensor * cur,
+                                            struct ggml_tensor * ids, struct ggml_tensor * weights, int layer) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+    const int64_t n_tokens = ids->ne[1];
+    GGML_ASSERT(ggml_nelements(cur) == cur->ne[0] * n_tokens && ggml_nelements(weights) == ids->ne[0] * n_tokens);
+    // the CPU fallback leaves the worker's result here; on CUDA only its first value is used (the job's number)
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cur->ne[0], n_tokens);
+    result->src[0] = cur;
+    result->src[1] = ids;
+    result->src[2] = weights;
+    return ggml_moe_la_fast_node(ctx, result, 24, layer);
+}
+
+struct ggml_tensor * ggml_moe_la_fast_collect(struct ggml_context * ctx, struct ggml_tensor * gpu_out,
+                                              struct ggml_tensor * start, int layer) {
+    GGML_ASSERT(gpu_out->type == GGML_TYPE_F32 && ggml_nelements(gpu_out) == ggml_nelements(start));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, start->ne[0], start->ne[1]);
+    result->src[0] = gpu_out;
+    result->src[1] = start;
+    return ggml_moe_la_fast_node(ctx, result, 25, layer);
+}
+
+int ggml_moe_la_gpu_batch(void) {
+    return ggml_moe_la_gpu_batch_min();
+}
+
+void ggml_moe_la_gpu_slot_tensors(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]) {
+    ggml_moe_la_set_slots(layer, slots, host, stride);
+}
+
+void ggml_moe_la_gpu_transit(int layer, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down) {
+    ggml_moe_la_set_transit(layer, gate, up, down);
+}
+
+// ids for the scratch tensors of a prompt batch; running it copies the experts the batch needs there.
+// gate, up, down: the expert tensors of the layer in host memory.
+struct ggml_tensor * ggml_moe_la_transit_op(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int                   layer,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * down) {
+    struct ggml_tensor * result = ggml_moe_la_aux_op(ctx, ids, 5, layer);
+    result->src[1] = gate;
+    result->src[2] = up;
+    result->src[3] = down;
+    return result;
+}
+
+bool ggml_moe_la_prefetch_active(int n_tokens) {
+    return ggml_moe_la_prefetching(n_tokens);
+}
+
+struct ggml_tensor * ggml_moe_la_prefetch_op(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        int                   layer) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 2, -4);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result->op     = GGML_OP_ARGSORT_THRESH;
+    result->grad   = NULL;
+    result->src[0] = logits;
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_la_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        int                   k,
+        int                   layer) {
+    GGML_ASSERT(a->ne[0] >= k);
+    struct ggml_tensor * result = ggml_argsort_thresh(ctx, a, 1, 0.0f);
+    if (w) {
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_are_same_shape(a, w) && w->nb[0] == sizeof(float));
+        result->src[1] = w;
+    }
+    ggml_set_op_params_i32(result, 2, (int32_t) k);
+    ggml_set_op_params_i32(result, 3, (int32_t) layer);
+    result = ggml_view_4d(ctx, result,
+                k, result->ne[1], result->ne[2], result->ne[3],
+                   result->nb[1], result->nb[2], result->nb[3],
+                0);
     return result;
 }
 
@@ -23384,6 +23574,21 @@ static void ggml_compute_forward_argsort_thresh_f32(
 
     int min_entries = ggml_get_op_params_i32(dst, 0);
     float thresh    = ggml_get_op_params_f32(dst, 1);
+    const int la_k = ggml_get_op_params_i32(dst, 2);
+    if (la_k > 0) {
+        // stateful (it tracks residency), so one thread walks the tokens in order
+        if (ith != 0) return;
+        const int la_layer = ggml_get_op_params_i32(dst, 3);
+        const struct ggml_tensor * w = dst->src[1];
+        ggml_moe_la_begin(la_layer);
+        for (int64_t i = 0; i < nr; ++i) {
+            ggml_moe_la_select(la_layer, (const float *)((char *) src0->data + i*nb01),
+                               w ? (const float *)((const char *) w->data + i*w->nb[1]) : NULL, (int) ne0, la_k,
+                               (int32_t *)((char *) dst->data + i*nb1));
+        }
+        ggml_moe_la_end(la_layer);
+        return;
+    }
 
     //if (ith == 0) printf("%s: min_entries = %d, thresh = %g\n", __func__, min_entries, (double)thresh);
 
@@ -23421,6 +23626,72 @@ static void ggml_compute_forward_argsort_thresh(
     struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
+
+    const int la_kind = -ggml_get_op_params_i32(dst, 2);
+    if (la_kind >= 20) {
+        // VRAM tier, fast path: the CPU fallback of the ops CUDA normally runs (slow but exact)
+        if (params->ith != 0) return;
+        const int layer = ggml_get_op_params_i32(dst, 3);
+        if (la_kind == 20) {
+            const int k = (int) dst->ne[0], n_expert = (int) src0->ne[0];
+            int32_t * slot   = (int32_t *) malloc(sizeof(int32_t) * n_expert);
+            float   * excess = (float *)   malloc(sizeof(float)   * n_expert);
+            ggml_moe_la_fast_tables(layer, n_expert, slot, excess);
+            float beta, gamma; int protect;
+            ggml_moe_la_fast_params(&beta, &gamma, &protect);
+            for (int64_t i = 0; i < src0->ne[1]; ++i) {
+                ggml_moe_la_fast_pick((const float *)((const char *) src0->data + i*src0->nb[1]), n_expert, k, slot, excess,
+                                      beta, gamma, protect, (int32_t *)((char *) dst->data + i*dst->nb[1]));
+            }
+            free(slot); free(excess);
+        } else if (la_kind == 21 || la_kind == 23) {
+            const size_t row = la_kind == 23 ? dst->nb[2] : dst->nb[1];
+            for (int64_t i = 0; i < src0->ne[1]; ++i) {
+                ggml_moe_la_aux(layer, la_kind - 20, (const int32_t *)((const char *) src0->data + i*src0->nb[1]),
+                                (int) src0->ne[0], (char *) dst->data + i*row);
+            }
+        } else if (la_kind == 24) {
+            const struct ggml_tensor * ids = dst->src[1];
+            const struct ggml_tensor * w   = dst->src[2];
+            GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(ids) && ggml_is_contiguous(w));
+            ggml_moe_la_fast_compute(layer, (int) ids->ne[1], (int) ids->ne[0], (int) src0->ne[0],
+                                     (const float *) src0->data, (const int32_t *) ids->data, (const float *) w->data,
+                                     (float *) dst->data);
+        } else if (la_kind == 25) {
+            const struct ggml_tensor * start = dst->src[1];
+            const int64_t n = ggml_nelements(dst);
+            for (int64_t i = 0; i < n; ++i) ((float *) dst->data)[i] = ((const float *) src0->data)[i] + ((const float *) start->data)[i];
+        }
+        return;
+    }
+    if (la_kind > 0) {
+        // load-aware: split a selection between the GPU slots and the CPU
+        if (params->ith != 0) return;
+        const int la_layer = ggml_get_op_params_i32(dst, 3);
+        if (la_kind == 4) {
+            // read-ahead for the next layer: per token while generating, the union for a batch
+            ggml_moe_la_guess(la_layer, (const float *) src0->data, (int) src0->ne[0], (int) src0->ne[1], src0->nb[1]);
+            *(int32_t *) dst->data = 0;
+            return;
+        }
+        if (la_kind == 5) {
+            const void * src[3];
+            size_t stride[3];
+            for (int t = 0; t < 3; ++t) {
+                src[t]    = dst->src[t + 1]->data;
+                stride[t] = ggml_nbytes(dst->src[t + 1]) / (size_t) dst->src[t + 1]->ne[2];
+            }
+            ggml_moe_la_transit(la_layer, (const int32_t *) src0->data, (int) src0->ne[0], (int) src0->ne[1], src0->nb[1],
+                                src, stride, (int32_t *) dst->data, dst->nb[1]);
+            return;
+        }
+        const size_t row = (la_kind == 3 || la_kind == 6) ? dst->nb[2] : dst->nb[1];
+        for (int64_t i = 0; i < src0->ne[1]; ++i) {
+            ggml_moe_la_aux(la_layer, la_kind, (const int32_t *)((const char *) src0->data + i*src0->nb[1]),
+                            (int) src0->ne[0], (char *) dst->data + i*row);
+        }
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:

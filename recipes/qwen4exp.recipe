@@ -1,0 +1,25 @@
+# Qwen3.8-Flash-Next (measured: UD-IQ4_XS, 94 GB, in real mode with batches of 16 and no
+# read-ahead, the way it generates; base: exact routing on the same path). Use with
+# LA_REAL=1 and --defer-ple when the file is larger than RAM.
+# Generated on 2026-10-26 from measured quality grids (see README.md). A level allows
+# that much KL above exact routing on every model measured, at 15% and 40% resident;
+# 'saved' is the share of exact routing's disk reads avoided, worst case.
+match arch=qwen4exp n_expert=512
+default balanced
+LA_PROFILE=profiles/qwen3.8-flash-next.f32
+
+[exact]
+# KL budget 0: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[near]
+# KL budget 0.005: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[balanced]
+# KL budget 0.02: +0.0150 KL, 38% of reads saved (worst case); at 40% resident +0.0107, 63%
+LA_WCAP=0.1
+
+[fast]
+# KL budget 0.1: +0.0898 KL, 93% of reads saved (worst case); at 40% resident +0.0301, 97%
+LA_BETA=1

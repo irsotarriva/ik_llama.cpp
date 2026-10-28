@@ -696,6 +696,23 @@ json oaicompat_chat_params_parse(
     if (!messages.is_array()) {
         throw std::runtime_error("Expected 'messages' to be an array");
     }
+    // "cache_control" on a message or on one of its content parts: a cache breakpoint at the end of that message
+    std::vector<json> cache_marks(messages.size());
+    for (size_t im = 0; im < messages.size(); ++im) {
+        const json & msg = messages[im];
+        if (!msg.is_object()) {
+            continue;
+        }
+        if (msg.contains("cache_control") && msg.at("cache_control").is_object()) {
+            cache_marks[im] = msg.at("cache_control");
+        } else if (msg.contains("content") && msg.at("content").is_array()) {
+            for (const auto & part : msg.at("content")) {
+                if (part.is_object() && part.contains("cache_control") && part.at("cache_control").is_object()) {
+                    cache_marks[im] = part.at("cache_control");
+                }
+            }
+        }
+    }
     for (auto& msg : messages) {
         std::string role = json_value(msg, "role", std::string());
         if (role != "assistant" && !msg.contains("content")) {
@@ -799,13 +816,55 @@ json oaicompat_chat_params_parse(
 
     common_chat_templates_inputs inputs;
     inputs.messages = common_chat_msgs_parse_oaicompat(messages);
+
+    // "draft": the last message is a user message that is still being typed. Its text is read into the
+    // context now and nothing is generated, so the request that follows when the user sends it finds
+    // most of its prompt already there (README-draft.md). The prompt of a draft is the prompt of the
+    // conversation cut where the text ends; a marker put after the text says where that is.
+    const bool draft = json_value(body, "draft", false);
+    static const std::string draft_end = "<<la-draft-end-7f3a>>";
+    int draft_hold_tokens = 1;
+    if (draft) {
+        if (inputs.messages.empty() || inputs.messages.back().role != "user") {
+            throw std::runtime_error("\"draft\" needs a user message at the end of the list");
+        }
+        common_chat_msg & last = inputs.messages.back();
+        std::string * text = &last.content;
+        if (!last.content_parts.empty()) {
+            if (last.content_parts.back().type != "text") {
+                throw std::runtime_error("a draft must end in text");
+            }
+            text = &last.content_parts.back().text;
+        }
+        // The word being typed is left out, with the blanks before it: both read as other tokens once
+        // the word is finished. A long run without blanks (text in a script that does not use them) is
+        // kept, and more tokens are held back at its end instead.
+        const auto blank = [](char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; };
+        size_t n = text->size();
+        if (n > 0 && !blank((*text)[n - 1])) {
+            size_t w = n;
+            while (w > 0 && !blank((*text)[w - 1])) {
+                w--;
+            }
+            if (n - w <= 48) {
+                n = w;
+            } else {
+                draft_hold_tokens = 4;
+            }
+        }
+        while (n > 0 && blank((*text)[n - 1])) {
+            n--;
+        }
+        text->resize(n);
+        text->append(draft_end);
+    }
     inputs.tools = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar = grammar;
     inputs.use_jinja = opt.use_jinja;
     inputs.parallel_tool_calls = json_value(body, "parallel_tool_calls", opt.parallel_tool_calls);
-    inputs.add_generation_prompt = json_value(body, "add_generation_prompt", true);
+    inputs.add_generation_prompt = !draft && json_value(body, "add_generation_prompt", true);
     inputs.reasoning_format = opt.reasoning_format;
     if (body.contains("reasoning_format")) {
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
@@ -861,6 +920,75 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    if (draft) {
+        const size_t at = chat_params.prompt.rfind(draft_end);
+        if (at == std::string::npos) {
+            throw std::runtime_error("the chat template does not keep the text of the draft in place");
+        }
+        chat_params.prompt.erase(at);
+    }
+
+    // Where a marked message ends in the prompt: the prompt of the messages up to it, if the full
+    // prompt starts with that (a template may write an earlier message differently once others follow).
+    json cache_breakpoints = json_value(body, "cache_breakpoints", json::array());
+
+    // The server's own point: where the last message opens (LA_LAST_MSG_POINT, on unless set to 0).
+    // The conversation is rendered twice more with the last message replaced by two different probes;
+    // the probes first differ where the message's text begins, and the prompt is cut there. Every
+    // later request that differs only in its last message (an edit, a new answer, a draft sent)
+    // resumes there without marks from the client. It is a checkpoint like the others, evicted like
+    // them, and only taken for models that cannot step back without one.
+    static const bool last_msg_point = [] {
+        const char * s = getenv("LA_LAST_MSG_POINT");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (last_msg_point && inputs.messages.size() >= 2) {
+        try {
+            const auto render_with = [&](const char * probe) {
+                common_chat_templates_inputs p = inputs;
+                common_chat_msg & last = p.messages.back();
+                last.content_parts.clear();
+                last.content = probe;
+                last.reasoning_content.clear();
+                last.tool_calls.clear();
+                return common_chat_templates_apply(opt.tmpls.get(), p).prompt;
+            };
+            const std::string a = render_with("\x01la-probe-a");
+            const std::string b = render_with("\x02la-probe-b");
+            const std::string & full = chat_params.prompt;
+            size_t at = 0;
+            while (at < a.size() && at < b.size() && at < full.size() && a[at] == b[at] && a[at] == full[at]) {
+                at++;
+            }
+            if (at > 0 && at < full.size()) {
+                cache_breakpoints.insert(cache_breakpoints.begin(), json{ {"chars", at}, {"server", true} });
+            }
+        } catch (const std::exception &) {
+            // the template does not accept the probe: no point
+        }
+    }
+    for (size_t im = 0; im < cache_marks.size() && im < inputs.messages.size(); ++im) {
+        if (cache_marks[im].is_null()) {
+            continue;
+        }
+        try {
+            common_chat_templates_inputs part = inputs;
+            part.messages.resize(im + 1);
+            part.add_generation_prompt = false;
+            const std::string head = common_chat_templates_apply(opt.tmpls.get(), part).prompt;
+            if (!head.empty() && head.size() < chat_params.prompt.size() && chat_params.prompt.compare(0, head.size(), head) == 0) {
+                json bp = { {"chars", head.size()} };
+                if (cache_marks[im].contains("ttl"))     bp["ttl"]     = cache_marks[im].at("ttl");
+                if (cache_marks[im].contains("persist")) bp["persist"] = cache_marks[im].at("persist");
+                cache_breakpoints.push_back(bp);
+            }
+        } catch (const std::exception &) {
+            // the template does not accept the shortened conversation: no breakpoint there
+        }
+    }
+    if (!cache_breakpoints.empty()) {
+        llama_params["cache_breakpoints"] = cache_breakpoints;
+    }
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {
@@ -937,6 +1065,14 @@ json oaicompat_chat_params_parse(
         // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
         if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
             llama_params[item.key()] = item.value();
+        }
+    }
+    if (draft) {
+        llama_params["n_predict"] = 0;
+        llama_params["stream"] = false;
+        llama_params["cache_prompt"] = true;
+        if (!body.contains("draft_hold_tokens")) {
+            llama_params["draft_hold_tokens"] = draft_hold_tokens;
         }
     }
 
@@ -1952,6 +2088,32 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
+// Cache breakpoints given as a number of characters of the prompt become a number of tokens. One that
+// does not fall between two tokens of the prompt is left without "n_tokens" and is ignored later.
+void resolve_cache_breakpoints(const llama_vocab * vocab, json & data, const json & prompt, const server_tokens & tokens) {
+    if (!data.contains("cache_breakpoints") || !data.at("cache_breakpoints").is_array() || !prompt.is_string()) {
+        return;
+    }
+    const std::string text = prompt.get<std::string>();
+    for (auto & bp : data.at("cache_breakpoints")) {
+        if (!bp.is_object() || bp.contains("n_tokens") || !bp.contains("chars")) {
+            continue;
+        }
+        const size_t chars = bp.at("chars").get<size_t>();
+        if (chars == 0 || chars >= text.size()) {
+            continue;
+        }
+        const llama_tokens head = common_tokenize(vocab, text.substr(0, chars), true, true);
+        bool same = head.size() < tokens.size();
+        for (size_t i = 0; same && i < head.size(); ++i) {
+            same = tokens[i] == head[i];
+        }
+        if (same) {
+            bp["n_tokens"] = (int32_t) head.size();
+        }
+    }
+}
+
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {

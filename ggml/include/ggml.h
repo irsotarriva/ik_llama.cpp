@@ -2509,6 +2509,70 @@ extern "C" {
             int                   k,
             int                   min_entries,
             float                 thresh);
+    // load-aware expert selection (see ggml-moe-la.h): like ggml_top_k over router
+    // probabilities, but entries may be -1 (dropped) and the choice depends on residency
+    GGML_API bool ggml_moe_la_active(void);
+    // memory the system could give a program now, and all of it, in bytes (0 if unknown)
+    GGML_API uint64_t ggml_moe_la_mem_available(void);
+    GGML_API uint64_t ggml_moe_la_mem_total(void);
+    // real mode (LA_REAL=1): the selector owns the memory of the routed experts
+    GGML_API bool ggml_moe_la_real_active(void);
+    GGML_API bool ggml_moe_la_take_tensor(int layer, struct ggml_tensor * tensor, const char * path, uint64_t file_offset);
+    GGML_API void ggml_moe_la_start(void);
+    // VRAM tier (LA_GPU_FRAC): some experts of a layer live in GPU slot tensors
+    GGML_API bool ggml_moe_la_gpu_active(void);
+    GGML_API int  ggml_moe_la_gpu_slots(int layer, int n_expert, int32_t * experts, int max_slots);
+    GGML_API void ggml_moe_la_gpu_drop(int layer);
+    // prompt batches on the GPU: smallest batch that uses the scratch tensors (0 = never), the scratch
+    // tensors of a layer, and the op that fills them and returns the ids to use with them
+    GGML_API int  ggml_moe_la_gpu_batch(void);
+    // a batch of n_tokens tokens that should run without the tier (see ggml-moe-la.h)
+    GGML_API bool ggml_moe_la_gpu_plain(int n_tokens);
+    GGML_API void ggml_moe_la_gpu_slot_tensors(int layer, struct ggml_tensor * const slots[3], const void * const host[3], const size_t stride[3]);
+    GGML_API void ggml_moe_la_gpu_transit(int layer, struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down);
+    GGML_API struct ggml_tensor * ggml_moe_la_transit_op(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            int                   layer,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * down);
+    // kind 1: slot ids for the GPU side, 2: expert ids for the CPU side, 3: float mask of the GPU side
+    GGML_API struct ggml_tensor * ggml_moe_la_aux_op(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            int                   kind,
+            int                   layer);
+    // VRAM tier, fast path (see ggml-moe-la.h): selection and slot ids on the GPU, the experts without a
+    // slot computed by a worker while the GPU runs the slots. The ops are ARGSORT_THRESH nodes with
+    // op_params[2] = -20 .. -25; CUDA runs them, the CPU has a slow fallback.
+    GGML_API bool ggml_moe_la_fast_active(int n_tokens);
+    GGML_API int  ggml_moe_la_fast_max(void);   // largest batch that takes the fast path (LA_FAST_MAX)
+    GGML_API void ggml_moe_la_fast_layer(int layer, struct ggml_tensor * gate, struct ggml_tensor * up,
+                                         struct ggml_tensor * down, float swiglu_limit, bool fused_up_gate);
+    // probs [n_expert, n_tokens] -> ids [k, n_tokens], most probable first
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_select(struct ggml_context * ctx, struct ggml_tensor * probs, int k, int layer);
+    // kind 1: slot ids of the GPU side (I32 [k, n]); kind 3: its mask (F32 [1, k, n]), as ggml_moe_la_aux_op
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_map(struct ggml_context * ctx, struct ggml_tensor * ids, int kind, int layer);
+    // hands the experts without a slot to the worker; cur [n_embd, 1, n_tokens], weights [1, k, n_tokens]
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_start(struct ggml_context * ctx, struct ggml_tensor * cur,
+                                                         struct ggml_tensor * ids, struct ggml_tensor * weights, int layer);
+    // gpu_out [n_embd, n_tokens] plus what the worker computed for `start`
+    GGML_API struct ggml_tensor * ggml_moe_la_fast_collect(struct ggml_context * ctx, struct ggml_tensor * gpu_out,
+                                                           struct ggml_tensor * start, int layer);
+    // read-ahead (LA_PREFETCH): logits = the router of `layer` applied to the previous layer's input
+    GGML_API bool ggml_moe_la_prefetch_active(int n_tokens);
+    GGML_API struct ggml_tensor * ggml_moe_la_prefetch_op(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            int                   layer);
+    // w: the unbiased gating values when a is biased for selection (null otherwise); LA_WCAP measures with them
+    GGML_API struct ggml_tensor * ggml_moe_la_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            int                   k,
+            int                   layer);
     GGML_API struct ggml_tensor * ggml_grouped_topk(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

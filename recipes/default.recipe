@@ -1,0 +1,24 @@
+# Any model without a recipe of its own: levels that held on every model measured.
+# No profile: the cache starts cold, and the VRAM tier needs one (make it with
+# LA_PROFILE_OUT, see LOAD_AWARE.md).
+# Generated on 2026-10-26 from measured quality grids (see README.md). A level allows
+# that much KL above exact routing on every model measured, at 15% and 40% resident;
+# 'saved' is the share of exact routing's disk reads avoided, worst case.
+match *
+default exact
+
+[exact]
+# KL budget 0: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[near]
+# KL budget 0.005: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[balanced]
+# KL budget 0.02: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[fast]
+# KL budget 0.1: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0

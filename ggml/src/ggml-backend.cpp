@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-moe-la.h"
 
 #include <cassert>
 #include <climits>
@@ -1362,8 +1363,46 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         return cur_backend_id;
     }
 
+    // The load-aware selection and its helper ops are ARGSORT_THRESH nodes with op_params[2] set, and
+    // only the CPU kernel knows about them (it tracks residency and reads experts in). A GPU backend
+    // that implements plain ARGSORT_THRESH (CUDA does) would run its own argsort instead: the experts
+    // are then never loaded and the CPU reads unbacked memory, or the helper's I32 input trips an assert.
+    // The fast path of the VRAM tier (-20 .. -25) is the other way round: its ops belong on the GPU, where
+    // the worker's mailbox is; the CPU has only a slow fallback for them.
+    if (tensor->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) tensor->op_params)[2] <= -20) {
+        for (int b = 0; b < sched->n_backends - 1; ++b) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.la-fast");
+                return b;
+            }
+        }
+        cur_backend_id = sched->n_backends - 1;
+        SET_CAUSE(tensor, "1.la-fast-cpu");
+        return cur_backend_id;
+    }
+    if (tensor->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) tensor->op_params)[2] != 0) {
+        cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
+        SET_CAUSE(tensor, "1.la");
+        return cur_backend_id;
+    }
+
+    // The CPU side of the load-aware VRAM tier sums its experts before the result goes to the GPU.
+    if (strncmp(tensor->name, "la_cpu", 6) == 0) {
+        cur_backend_id = sched->n_backends - 1;
+        SET_CAUSE(tensor, "1.la");
+        return cur_backend_id;
+    }
+
     // operations with weights are preferably run on the same backend as the weights
     bool offload_enabled = ggml_backend_sched_offload_enabled(sched, tensor->op);
+    // With the load-aware VRAM tier, the CPU side of an expert op gets ids where -1 means "runs in a
+    // GPU slot, skip". Only the CPU kernels know that convention: never hand such an op to a GPU.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * src = tensor->src[i];
+        if (src != NULL && src->op == GGML_OP_ARGSORT_THRESH && ((const int32_t *) src->op_params)[2] == -2) {
+            offload_enabled = false;
+        }
+    }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * src = tensor->src[i];
         if (src == NULL) {
@@ -1372,7 +1411,8 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
             // check if a backend with higher prio wants to offload the op
-            if (offload_enabled && src_backend_id == sched->n_backends - 1) {
+            // a tensor the load-aware cache owns is only partly in memory: never copy it to a GPU
+            if (offload_enabled && src_backend_id == sched->n_backends - 1 && !ggml_moe_la_owns(src->data)) {
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");

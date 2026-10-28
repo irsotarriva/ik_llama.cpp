@@ -58,6 +58,8 @@ add_library(llama
             llama-model.cpp
             llama-reload-info.h
             llama-reload.cpp
+            llama-la-recipe.h
+            llama-la-recipe.cpp
             llama-quantize.cpp
             llama-arch.h
             llama-arch.cpp
@@ -150,6 +152,9 @@ target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
+
+# expert-cache recipes used when LA_RECIPES is not given
+target_compile_definitions(llama PRIVATE LLAMA_LA_RECIPES_DIR="${PROJECT_SOURCE_DIR}/recipes")
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

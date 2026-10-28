@@ -2,6 +2,29 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+## What this fork adds
+
+This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), itself a fork of
+[llama.cpp](https://github.com/ggml-org/llama.cpp). The expert cache steps in only when a model's
+experts do not fit in RAM, everything else is off unless a client asks for it, and
+`--expert-cache off` gives the engine exactly as ik_llama.cpp.
+
+- **Load-aware expert cache for MoE models.** Keep only part of a model's experts in RAM (and
+  optionally the most used ones in VRAM) and read the rest from disk when the router asks. A bias
+  toward experts already in memory trades a little quality for far fewer disk reads, so models
+  larger than RAM run at usable speed. On by default, and only when the experts do not fit in RAM; at
+  the default quality, `exact`, the output is the same as with the whole model in memory.
+  Flags: `--experts-ram`, `--experts-vram`, `--quality`, `--expert-cache`; see [LOAD_AWARE.md](LOAD_AWARE.md).
+- **Recipes.** Measured settings per model family, picked from the model's metadata, at quality
+  levels from `exact` to `fast`: [recipes/README.md](recipes/README.md).
+- **Prompt cache on disk, controlled by the client.** A client marks where checkpoints go and which
+  ones to keep on disk, so long, stable prompts (a coding agent's system prompt and tools) are not
+  read again on every request: [examples/server/README-cache.md](examples/server/README-cache.md).
+- **Drafts.** A client sends the message while the user is still typing it; the server reads it in
+  the background, so on a CPU the first token comes in about a second instead of several:
+  [examples/server/README-draft.md](examples/server/README-draft.md).
+- **Metal kernels** for the linear-attention layers (DELTA_NET, SSM_CONV, L2_NORM, softplus).
+
 ## TL;DR
 
 This repository started as a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) in June of 2024 and was last synced with upstream in August of 2024. Compared to mainline `llama.cpp`, it offers additional SOTA quantization types and, in many cases, better performance. Various features related to LLM inference appeared here first before becoming available in llama.cpp. MLA, quant repacking, fused delta-net (known in `llama.cpp as "Gated Delta Net" - GDN), tensor parallel, MTP, DFlash, to just name a few.

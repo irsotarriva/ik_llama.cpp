@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-la-recipe.h"
 #include "ggml.h"
 
 
@@ -6287,7 +6288,9 @@ bool create_tensors_helper::create_tensors() {
     // On a box whose CPU-side weights exceed RAM that is impossible, and GGML_CUDA_NO_PINNED, the
     // documented escape, also turns off every pinned staging buffer. GGML_CUDA_NO_PINNED_WEIGHTS
     // keeps the weights mmapped (unpinned) and leaves the staging buffers pinned.
-    if (getenv("GGML_CUDA_NO_PINNED") == nullptr && getenv("GGML_CUDA_NO_PINNED_WEIGHTS") == nullptr) {
+    // The expert cache reading from disk needs the mapping too: pinned memory would hold every expert.
+    if (getenv("GGML_CUDA_NO_PINNED") == nullptr && getenv("GGML_CUDA_NO_PINNED_WEIGHTS") == nullptr &&
+        !(has_buft_overrides && use_mmap_buffer && llama_la_reads_disk(model, ctx_map))) {
         use_mmap_buffer &= !has_buft_overrides;
     }
 

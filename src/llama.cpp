@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "llama-la-rows.h"
 #include "llama-impl.h"
 #if defined(__linux__) || defined(__APPLE__)
+#include <atomic>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -29,6 +31,7 @@
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
 #include "llama-quantize.h"
+#include "llama-la-recipe.h"
 
 #include "unicode.h"
 
@@ -425,6 +428,7 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    llama_la_rows::get().detach();
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -5173,6 +5177,10 @@ static bool llm_load_tensors(
     }
 #endif
 
+    // every weight has its place and none is read yet: decide whether the expert cache runs, before
+    // anything asks it (the mappings below are not prefetched when it reads from disk)
+    if (!dry_run) llama_la_decide(model, ml.use_mmap, ctx_map);
+
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
     ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run
 #if defined(_WIN32)
@@ -5208,12 +5216,34 @@ static bool llm_load_tensors(
     size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     model.bufs.reserve(n_max_backend_buffer);
 
+    LLAMA_LOG_INFO("%s: weights %s (use_mmap=%d, mmap_buffer=%d)\n", __func__, ml.use_mmap && use_mmap_buffer ? "stay mapped from the file" : "are copied into memory", (int) ml.use_mmap, (int) use_mmap_buffer);
     for (auto & it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx              = it.second;
 
         llama_buf_map bufs;
         bufs.reserve(n_max_backend_buffer);
+
+#ifdef GGML_USE_METAL
+        // A Metal buffer made from the file mapping covers everything between its first and last
+        // tensor and Metal keeps all of it in memory. With the experts on the CPU the Metal tensors
+        // are scattered over the whole file, so the span is the model, not the offloaded part.
+        // In that case give Metal its own copy of just its tensors.
+        bool metal_alias_mmap = true;
+        if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_metal_buffer_type()) {
+            size_t used = 0, span = 0;
+            for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                used += ggml_nbytes(t);
+            }
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                void * addr = nullptr;
+                size_t first, last;
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (last > first) span += last - first;
+            }
+            metal_alias_mmap = span <= 2*used;
+        }
+#endif
 
         // only the mmap region containing the tensors in the model is mapped to the backend buffer
         // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
@@ -5247,7 +5277,7 @@ static bool llm_load_tensors(
             }
         }
 #ifdef GGML_USE_METAL
-        else if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_metal_buffer_type()) {
+        else if (ml.use_mmap && use_mmap_buffer && metal_alias_mmap && buft == ggml_backend_metal_buffer_type()) {
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 void * addr = nullptr;
@@ -5502,6 +5532,144 @@ static bool llm_load_tensors(
         llm_requantize_output_tensor(model, extra_output_type);
     }
 
+    if (ggml_moe_la_active() && !dry_run) {
+        // A second model must not touch the selector's layers: an MTP companion has no routed experts
+        // in the layers of its target, so its load dropped the target's GPU slots, and in real mode
+        // it started the cache a second time (the starting set was read twice).
+        static std::atomic<bool> la_claimed{false};
+        model.la_owner = !la_claimed.exchange(true);
+        if (!model.la_owner) {
+            LLAMA_LOG_INFO("%s: the load-aware selector belongs to the model loaded before this one; this one runs without it\n", __func__);
+        }
+    }
+
+    if (model.la_owner && ggml_moe_la_gpu_active() && !dry_run) {
+        // load-aware VRAM tier: copy the most used experts of each layer into GPU slot tensors
+        const int gpu_id = (model.main_gpu >= 0 && model.main_gpu < (int) model.devices.size())
+            ? model.devices[model.main_gpu] : std::max(0, (int) model.main_gpu);
+        ggml_backend_buffer_type_t slot_buft = llama_default_buffer_type_offload(model, gpu_id);
+        const int n_la_layers = (int) model.layers.size();
+        model.la_slots.assign(n_la_layers, { nullptr, nullptr, nullptr });
+        std::vector<std::vector<int32_t>> slot_experts(n_la_layers);
+        struct ggml_init_params ip = { ggml_tensor_overhead()*(size_t)(6*n_la_layers + 8), nullptr, true };
+        model.la_transit.assign(n_la_layers, { nullptr, nullptr, nullptr });
+        std::vector<int> transit_like;      // layers that own a set of scratch tensors
+        size_t transit_bytes = 0;
+        ggml_context * sctx = slot_buft ? ggml_init(ip) : nullptr;
+        size_t n_slots = 0;
+        for (int il = 0; sctx && il < n_la_layers; ++il) {
+            auto & layer = model.layers[il];
+            ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+            bool ok = true;
+            for (ggml_tensor * t : exps) {
+                ok = ok && t && t->data && !t->view_src && (!t->buffer || ggml_backend_buffer_is_host(t->buffer));
+            }
+            if (!ok) { ggml_moe_la_gpu_drop(il); continue; }
+            const int n_exp = (int) exps[0]->ne[2];
+            slot_experts[il].resize(n_exp);
+            const int n = ggml_moe_la_gpu_slots(il, n_exp, slot_experts[il].data(), n_exp);
+            slot_experts[il].resize(n);
+            if (n == 0) continue;
+            // a selected expert that runs on the CPU is pointed at a slot its token does not use, and
+            // every id of a token must be distinct, so a layer needs at least n_expert_used slots
+            if (n < (int) model.hparams.n_expert_used) { ggml_moe_la_gpu_drop(il); continue; }
+            for (int j = 0; j < 3; ++j) {
+                ggml_tensor * s = ggml_new_tensor_3d(sctx, exps[j]->type, exps[j]->ne[0], exps[j]->ne[1], n);
+                ggml_format_name(s, "blk.%d.la_slots.%d", il, j);
+                model.la_slots[il][j] = s;
+            }
+            n_slots += n;
+            if (ggml_moe_la_gpu_batch() > 0) {
+                int like = -1;
+                for (int o : transit_like) {
+                    ggml_tensor * oe[3] = { model.layers[o].ffn_gate_exps, model.layers[o].ffn_up_exps, model.layers[o].ffn_down_exps };
+                    bool same = true;
+                    for (int j = 0; j < 3; ++j) same = same && oe[j]->type == exps[j]->type && ggml_are_same_shape(oe[j], exps[j]);
+                    if (same) { like = o; break; }
+                }
+                if (like < 0) {
+                    for (int j = 0; j < 3; ++j) {
+                        ggml_tensor * s = ggml_new_tensor_3d(sctx, exps[j]->type, exps[j]->ne[0], exps[j]->ne[1], exps[j]->ne[2]);
+                        ggml_format_name(s, "blk.%d.la_transit.%d", il, j);
+                        model.la_transit[il][j] = s;
+                        transit_bytes += ggml_nbytes(s);
+                    }
+                    transit_like.push_back(il);
+                } else {
+                    model.la_transit[il] = model.la_transit[like];
+                }
+            }
+        }
+        ggml_backend_buffer_t sbuf = (sctx && n_slots > 0) ? ggml_backend_alloc_ctx_tensors_from_buft(sctx, slot_buft) : nullptr;
+        if (!sbuf) {
+            LLAMA_LOG_WARN("%s: load-aware VRAM tier: no GPU slots could be allocated, running without it\n", __func__);
+            for (int il = 0; il < n_la_layers; ++il) ggml_moe_la_gpu_drop(il);
+            model.la_slots.clear();
+            model.la_transit.clear();
+            if (sctx) ggml_free(sctx);
+        } else {
+            model.ctxs.push_back(sctx);
+            model.bufs.push_back(sbuf);
+            // Without this the scheduler does not tie the slot ops to the GPU: they end up on the CPU and
+            // the slot weights are copied back to host memory on every evaluation.
+            ggml_backend_buffer_set_usage(sbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            // the scratch tensors are read at indices nothing was written to (see ggml_moe_la_transit)
+            ggml_backend_buffer_clear(sbuf, 0);
+            for (int il = 0; il < n_la_layers; ++il) {
+                if (model.la_transit[il][0]) ggml_moe_la_gpu_transit(il, model.la_transit[il][0], model.la_transit[il][1], model.la_transit[il][2]);
+            }
+            if (transit_bytes > 0) {
+                LLAMA_LOG_INFO("%s: load-aware VRAM tier: %zu sets of scratch tensors for prompt batches (%.1f MiB)\n", __func__,
+                        transit_like.size(), transit_bytes/1024.0/1024.0);
+            }
+            for (int il = 0; il < n_la_layers; ++il) {
+                if (!model.la_slots[il][0]) continue;
+                auto & layer = model.layers[il];
+                ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+                const void * host[3];
+                size_t strides[3];
+                for (int j = 0; j < 3; ++j) {
+                    const size_t stride = ggml_nbytes(exps[j]) / (size_t) exps[j]->ne[2];
+                    for (size_t slot = 0; slot < slot_experts[il].size(); ++slot) {
+                        ggml_backend_tensor_set(model.la_slots[il][j],
+                                (const char *) exps[j]->data + (size_t) slot_experts[il][slot]*stride, slot*stride, stride);
+                    }
+                    host[j]    = exps[j]->data;
+                    strides[j] = stride;
+                }
+                ggml_moe_la_gpu_slot_tensors(il, model.la_slots[il].data(), host, strides);
+                // the fast path's worker computes this layer's other experts from the host tensors
+                ggml_moe_la_fast_layer(il, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps,
+                                       model.swiglu_limit(il, false), true);
+            }
+#ifdef GGML_USE_CUDA
+            if (ggml_moe_la_fast_active(1)) {
+                ggml_cuda_la_fast_prepare(gpu_id, n_la_layers, (int) model.hparams.n_expert, (int) model.hparams.n_embd,
+                                          (int) model.hparams.n_expert_used, ggml_moe_la_fast_max());
+            }
+#endif
+            LLAMA_LOG_INFO("%s: load-aware VRAM tier: %zu experts in GPU slots (%.1f MiB)\n", __func__, n_slots,
+                    ggml_backend_buffer_get_size(sbuf)/1024.0/1024.0);
+        }
+    }
+
+    if (model.la_owner && ggml_moe_la_real_active() && !dry_run) {
+        // load-aware real mode: the selector takes over the memory of the routed experts
+        int n_taken = 0;
+        for (int il = 0; il < (int) model.layers.size(); ++il) {
+            auto & layer = model.layers[il];
+            ggml_tensor * exps[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+            for (ggml_tensor * t : exps) {
+                if (!t || !t->data || t->view_src) continue;
+                const auto * w = ml.get_weight(ggml_get_name(t));
+                if (!w) continue;
+                if (ggml_moe_la_take_tensor(il, t, ml.files.at(w->idx)->get_path().c_str(), w->offs)) ++n_taken;
+            }
+        }
+        LLAMA_LOG_INFO("%s: load-aware real mode took over %d routed-expert tensors\n", __func__, n_taken);
+        ggml_moe_la_start();
+    }
+
     if (use_mmap_buffer || keep_ple_mapping) {
         for (auto & mapping : ml.mappings) {
             model.mappings.emplace_back(std::move(mapping));
@@ -5684,6 +5852,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         }
 
         llm_load_print_meta(ml, model);
+
+        // before any tensor is loaded: the selector reads its LA_* settings at the first expert tensor
+        if (!params.vocab_only) llama_la_apply_recipe(model, fname);
 
         if (model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE &&
             model.hparams.n_vocab != model.vocab.n_tokens()) {
@@ -7126,7 +7297,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             hist[pos] = tok_of(i);
         }
 
-        llama_prefetch_rows(lctx.model.tok_embd_per_layer, data, n_tokens * n_heads);
+        // the rows are known here, before any layer runs: have them in memory by then
+        if (llama_la_rows::get().active() && lctx.model.tok_embd_per_layer && ggml_backend_buffer_is_host(lctx.model.tok_embd_per_layer->buffer)) {
+            llama_la_rows::get().touch(lctx.model.tok_embd_per_layer, data, (int64_t) n_tokens * n_heads, n_tokens);
+        } else {
+            llama_prefetch_rows(lctx.model.tok_embd_per_layer, data, n_tokens * n_heads);
+        }
     }
 
     if (lctx.inp_pos_bucket) {
@@ -10057,7 +10233,10 @@ struct llama_context * llama_init_from_model(
 
             llama_repack_up_gate_exps(*ctx);
 
-            if (cparams.moe_cache_size > 0) {
+            if (cparams.moe_cache_size > 0 && model->la_owner) {
+                // the load-aware cache places the experts of this model itself; the two do not combine
+                LLAMA_LOG_WARN("%s: --moe-cache-mib is ignored while the load-aware expert cache (LA_ENABLE) is on\n", __func__);
+            } else if (cparams.moe_cache_size > 0) {
                 try {
                     ctx->moe_cache = std::make_unique<llama_moe_cache>(*model, ctx->backends, backend_buft,
                             cparams.moe_cache_size);
@@ -13263,6 +13442,12 @@ static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, con
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + data_ctx.get_size_written());
     return res;
+}
+
+void llama_kv_cache_seq_set_tokens(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_tokens) {
+    if (ctx->model.hparams.ple_n_heads > 0) {
+        ctx->ple_hist[seq_id].assign(tokens, tokens + n_tokens);
+    }
 }
 
 static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {

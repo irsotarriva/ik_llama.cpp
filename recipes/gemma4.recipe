@@ -1,0 +1,24 @@
+# Gemma4-26B-A4B (measured: the Omega-Evolution finetune, Q4_K_M). Its CPU and GPU paths
+# differ by KL 0.08 on their own; the levels count only what the selector adds.
+# Generated on 2026-10-26 from measured quality grids (see README.md). A level allows
+# that much KL above exact routing on every model measured, at 15% and 40% resident;
+# 'saved' is the share of exact routing's disk reads avoided, worst case.
+match arch=gemma4 n_expert=128
+default exact
+LA_PROFILE=profiles/gemma4-26b-a4b.f32
+
+[exact]
+# KL budget 0: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[near]
+# KL budget 0.005: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[balanced]
+# KL budget 0.02: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%
+LA_BETA=0
+
+[fast]
+# KL budget 0.1: +0.0874 KL, 30% of reads saved (worst case); at 40% resident +0.0590, 46%
+LA_WCAP=0.1
