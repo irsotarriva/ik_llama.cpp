@@ -67,12 +67,10 @@ On `/completion` and `/v1/completions` the same is given directly:
 
 ## The store
 
-Environment variables, read at start:
-
-| variable | meaning |
-|---|---|
-| `LA_CACHE_DIR=folder` | keep states that clients mark with a `ttl` in this folder. Without it marks only make checkpoints in memory |
-| `LA_CACHE_MAX_GB=20` | size limit. Over it, the entries that expire soonest are deleted |
+| flag | variable | meaning |
+|---|---|---|
+| `--cache-disk DIR` | `LA_CACHE_DIR` | keep states that clients mark with a `ttl` in this folder. Without it marks only make checkpoints in memory |
+| `--cache-disk-max 20G` | `LA_CACHE_MAX_GB` | size limit. Over it, the entries that expire soonest are deleted |
 
 - An entry is deleted when its time is up. Every request that uses it starts its time again, with
   the lifetime it was created with.

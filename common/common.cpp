@@ -1315,6 +1315,22 @@ static common_speculative_stage_params common_speculative_stage_from_arg(const s
 
 #define CHECK_ARG if (++i >= argc) { invalid_param = true; return true; }
 
+// The expert cache and the disk prompt cache read their settings from LA_* variables when the model
+// is loaded or the server starts; these flags set them (see LOAD_AWARE.md).
+static void la_set_env(const char * name, const std::string & value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+// "24G", "24GB", "24GiB", "512M", "1.5T"; a plain number is GiB
+static bool la_size_ok(const std::string & s) {
+    static const std::regex re("^[0-9]*\\.?[0-9]+ *([gGmMtT]([iI]?[bB])?)?$");
+    return std::regex_match(s, re);
+}
+
 bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_params & params, int & i, bool & invalid_param) {
     const char split_delim = ',';
 
@@ -2379,6 +2395,62 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-draft" || arg == "--draft-params") {
         CHECK_ARG
         params.speculative.params = argv[i];
+        return true;
+    }
+    if (arg == "--expert-cache") {
+        CHECK_ARG
+        const std::string v = argv[i];
+        if (v != "auto" && v != "on" && v != "off") {
+            fprintf(stderr, "error: --expert-cache takes auto, on or off, not '%s'\n", v.c_str());
+            invalid_param = true;
+            return true;
+        }
+        la_set_env("LA_EXPERT_CACHE", v);
+        return true;
+    }
+    if (arg == "--experts-ram" || arg == "--experts-vram") {
+        CHECK_ARG
+        const std::string v = argv[i];
+        if (!(arg == "--experts-ram" && v == "auto") && !la_size_ok(v)) {
+            fprintf(stderr, "error: %s takes a size such as 24G or 512M%s, not '%s'\n", arg.c_str(),
+                    arg == "--experts-ram" ? ", or auto" : "", v.c_str());
+            invalid_param = true;
+            return true;
+        }
+        la_set_env(arg == "--experts-ram" ? "LA_EXPERTS_RAM" : "LA_EXPERTS_VRAM", v);
+        return true;
+    }
+    if (arg == "--quality") {
+        CHECK_ARG
+        const std::string v = argv[i];
+        if (v != "exact" && v != "near" && v != "balanced" && v != "fast") {
+            fprintf(stderr, "error: --quality takes exact, near, balanced or fast, not '%s'\n", v.c_str());
+            invalid_param = true;
+            return true;
+        }
+        la_set_env("LA_RECIPE_LEVEL", v);
+        return true;
+    }
+    if (arg == "--cache-disk") {
+        CHECK_ARG
+        la_set_env("LA_CACHE_DIR", argv[i]);
+        return true;
+    }
+    if (arg == "--cache-disk-max") {
+        CHECK_ARG
+        const std::string v = argv[i];
+        double gb = 0;
+        if (!la_size_ok(v)) {
+            fprintf(stderr, "error: --cache-disk-max takes a size such as 20G, not '%s'\n", v.c_str());
+            invalid_param = true;
+            return true;
+        }
+        gb = std::stod(v);
+        const size_t at = v.find_first_not_of("0123456789. ");
+        const char u = at == std::string::npos ? 'g' : (char) std::tolower((unsigned char) v[at]);
+        if (u == 'm') gb /= 1024.0;
+        if (u == 't') gb *= 1024.0;
+        la_set_env("LA_CACHE_MAX_GB", std::to_string(gb));
         return true;
     }
     if (arg == "-cmoe" || arg == "--cpu-moe") {
@@ -3597,6 +3669,17 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "       --moe-cache-mib N",       "Total GPU cache budget in MiB for CPU-resident MoE experts, split across GPUs (default: 0, disabled)"});
+    options.push_back({ "expert cache" });
+    options.push_back({ "*",           "       --expert-cache MODE",     "auto: on only when the routed experts in RAM do not fit --experts-ram, then the rest is read\n"
+                                                                         "from disk; on: always; off: never (default: auto)" });
+    options.push_back({ "*",           "       --experts-ram SIZE",      "RAM for routed experts that run on the CPU, such as 24G (default: auto, what is free\n"
+                                                                         "less the other weights and a reserve)" });
+    options.push_back({ "*",           "       --experts-vram SIZE",     "VRAM for the most used of those experts, such as 4G (default: 0)" });
+    options.push_back({ "*",           "       --quality LEVEL",         "exact: always the router's experts; near, balanced, fast: may serve an expert already in\n"
+                                                                         "memory instead of reading one, for less quality (default: exact)" });
+    options.push_back({ "*",           "       --cache-disk DIR",        "server: keep prompt states that clients mark with a ttl in DIR (default: none)" });
+    options.push_back({ "*",           "       --cache-disk-max SIZE",   "server: size limit of --cache-disk (default: 20G)" });
+    options.push_back({ "backend" });
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
     options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});

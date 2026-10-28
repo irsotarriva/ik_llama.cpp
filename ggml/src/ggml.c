@@ -11013,6 +11013,14 @@ struct ggml_tensor * ggml_top_k_thresh(
 
 // ggml_moe_la_topk
 
+uint64_t ggml_moe_la_mem_available(void) {
+    return ggml_moe_la_os_available();
+}
+
+uint64_t ggml_moe_la_mem_total(void) {
+    return ggml_moe_la_os_total();
+}
+
 bool ggml_moe_la_active(void) {
     return ggml_moe_la_enabled();
 }

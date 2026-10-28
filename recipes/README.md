@@ -1,21 +1,20 @@
 # Load-aware recipes
 
 Measured selector settings per model family, so a result can be reproduced without remembering
-which variables it took. Turn them on with
-
-    LA_RECIPES=path/to/recipes llama-server -m model.gguf ...
+which variables it took. The engine uses the recipes in this folder of the source tree it was built
+from; `LA_RECIPES=path/to/recipes` points it elsewhere.
 
 At load the engine reads every `*.recipe` here, takes the one that matches the model best (the most
 `match` keys that hold; `default.recipe` matches anything) and sets its variables. It prints what
 it chose:
 
-    la-recipe: qwen35moe.recipe, level 'balanced': LA_ENABLE=1 LA_PROFILE=.../qwen3.6-35b-a3b.f32 LA_WCAP=0.2
+    la-recipe: qwen35moe.recipe, level 'exact': LA_PROFILE=.../qwen3.6-35b-a3b.f32 LA_BETA=0
 
-- `LA_RECIPE_LEVEL=exact|near|balanced|fast` picks a level; without it the recipe's `default`.
+- `--quality exact|near|balanced|fast` (or `LA_RECIPE_LEVEL`) picks a level; without it `exact`.
 - A variable already set by hand is kept (`la-recipe: given by hand, kept: ...`).
 - `LA_RECIPES` may also name one file.
-- Memory sizing is not in the recipes: `LA_RESIDENT_FRAC`, `LA_GPU_FRAC`, `LA_REAL` depend on the
-  machine (`LOAD_AWARE.md`, "Sizing the resident share").
+- A recipe does not decide whether the cache runs or how much memory it gets: that depends on the
+  machine and is chosen at load (`--experts-ram`, `--experts-vram`; `LOAD_AWARE.md`).
 
 ## Levels
 

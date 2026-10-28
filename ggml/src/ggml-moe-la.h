@@ -63,6 +63,10 @@ extern "C" {
 
 struct ggml_tensor;
 
+// memory the system could give a program now, and all of it, in bytes (0 if unknown)
+uint64_t ggml_moe_la_os_available(void);
+uint64_t ggml_moe_la_os_total(void);
+
 bool ggml_moe_la_enabled(void);
 bool ggml_moe_la_real(void);
 // True if `data` is the memory of a tensor taken over in real mode. Such a tensor is only

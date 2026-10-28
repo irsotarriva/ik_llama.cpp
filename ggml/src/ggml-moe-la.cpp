@@ -157,6 +157,20 @@ uint64_t os_available() {
 #endif
 }
 
+// Physical memory of the machine, in bytes; 0 if unknown.
+uint64_t os_total() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
+#elif defined(__APPLE__) || defined(__linux__)
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+#else
+    return 0;
+#endif
+}
+
 #if defined(_WIN32)
 typedef HANDLE la_fd;
 const la_fd LA_BAD_FD = INVALID_HANDLE_VALUE;
@@ -904,6 +918,9 @@ la_state & state() {
 }
 
 } // namespace
+
+uint64_t ggml_moe_la_os_available(void) { return os_available(); }
+uint64_t ggml_moe_la_os_total(void)     { return os_total(); }
 
 bool ggml_moe_la_enabled(void) { return state().enabled; }
 bool ggml_moe_la_real(void)    { return state().enabled && state().real; }

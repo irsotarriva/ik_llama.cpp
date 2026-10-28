@@ -5,13 +5,16 @@
 ## What this fork adds
 
 This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), itself a fork of
-[llama.cpp](https://github.com/ggml-org/llama.cpp). Everything below is off by default; without it
-the engine behaves exactly as ik_llama.cpp.
+[llama.cpp](https://github.com/ggml-org/llama.cpp). The expert cache steps in only when a model's
+experts do not fit in RAM, everything else is off unless a client asks for it, and
+`--expert-cache off` gives the engine exactly as ik_llama.cpp.
 
 - **Load-aware expert cache for MoE models.** Keep only part of a model's experts in RAM (and
   optionally the most used ones in VRAM) and read the rest from disk when the router asks. A bias
   toward experts already in memory trades a little quality for far fewer disk reads, so models
-  larger than RAM run at usable speed. Settings: [LOAD_AWARE.md](LOAD_AWARE.md).
+  larger than RAM run at usable speed. On by default, and only when the experts do not fit in RAM; at
+  the default quality, `exact`, the output is the same as with the whole model in memory.
+  Flags: `--experts-ram`, `--experts-vram`, `--quality`, `--expert-cache`; see [LOAD_AWARE.md](LOAD_AWARE.md).
 - **Recipes.** Measured settings per model family, picked from the model's metadata, at quality
   levels from `exact` to `fast`: [recipes/README.md](recipes/README.md).
 - **Prompt cache on disk, controlled by the client.** A client marks where checkpoints go and which

@@ -5,7 +5,6 @@
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match arch=gemma4 n_expert=128
 default exact
-LA_ENABLE=1
 LA_PROFILE=profiles/gemma4-26b-a4b.f32
 
 [exact]

@@ -4,7 +4,6 @@
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match arch=qwen35moe n_expert=256
 default balanced
-LA_ENABLE=1
 LA_PROFILE=profiles/qwen3.6-35b-a3b.f32
 
 [exact]

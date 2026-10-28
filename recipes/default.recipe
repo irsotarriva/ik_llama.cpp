@@ -6,7 +6,6 @@
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match *
 default exact
-LA_ENABLE=1
 
 [exact]
 # KL budget 0: +0.0000 KL, 0% of reads saved (worst case); at 40% resident +0.0000, 0%

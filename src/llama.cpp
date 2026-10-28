@@ -5177,6 +5177,10 @@ static bool llm_load_tensors(
     }
 #endif
 
+    // every weight has its place and none is read yet: decide whether the expert cache runs, before
+    // anything asks it (the mappings below are not prefetched when it reads from disk)
+    if (!dry_run) llama_la_decide(model, ml.use_mmap, ctx_map);
+
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
     ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run
 #if defined(_WIN32)

@@ -1,19 +1,55 @@
-# Load-aware expert cache: settings
+# Load-aware expert cache
 
-This fork of ik_llama.cpp can keep only part of a mixture-of-experts model's
-routed experts in memory and read the others from the GGUF when the router asks for them. Everything
-is switched with environment variables, read once at start by `llama-cli`, `llama-server` and
-`llama-perplexity`. Without `LA_ENABLE=1` the engine behaves as upstream.
+This fork of ik_llama.cpp can keep only part of a mixture-of-experts model's routed experts in memory
+and read the others from the GGUF when the router asks for them, so a model larger than RAM runs at a
+usable speed instead of thrashing the disk.
 
-Measured settings per model family are kept as recipes: `LA_RECIPES=path/to/recipes` sets
-them from the model's metadata, `LA_RECIPE_LEVEL=exact|near|balanced|fast` picks how much quality
-they may give up, and any variable set by hand wins (`recipes/README.md`).
+## Using it
 
-## The settings that matter
+It is on by default and steps in only when needed. Once the weights are placed, the engine adds up the
+routed experts that run on the CPU:
+
+- if they fit in the RAM set aside for them, nothing changes: the engine runs exactly as ik_llama.cpp;
+- if they do not, the most used experts are kept in that RAM and the others are read from disk when
+  the router asks for them. At the default quality, `exact`, every token still gets the experts the
+  router chose: the output is the same as with the whole model in memory, only slower.
+
+| flag | meaning |
+|---|---|
+| `--experts-ram SIZE` | RAM for the routed experts, such as `24G` or `512M`. Default `auto`: the memory free at load, less the other weights and a reserve of the larger of 10% and 2 GiB, which is kept free while the model runs |
+| `--experts-vram SIZE` | VRAM for the most used experts, such as `4G` (default 0). Put the dense layers on the GPU and the experts on the CPU: `-ngl 99 --cpu-moe` |
+| `--quality LEVEL` | `exact` (default): always the router's experts. `near`, `balanced`, `fast`: a token may be served an expert already in memory instead of one that would be read from disk, for less quality and fewer reads. Only matters when experts are read from disk |
+| `--expert-cache MODE` | `auto` (default), `on` (also when everything fits, for recording a usage profile) or `off` (never; the engine as ik_llama.cpp) |
+
+Examples:
+
+```
+llama-server -m model.gguf                                   # auto: on only if the experts do not fit
+llama-server -m model.gguf --experts-ram 20G --quality near  # 20 GiB for experts, may swap a few
+llama-server -m model.gguf -ngl 99 --cpu-moe --experts-vram 6G
+llama-server -m model.gguf --expert-cache off                # as ik_llama.cpp
+```
+
+Reading from disk needs the model memory-mapped (no `--no-mmap`). The log says what was chosen:
+`expert cache: on, 13.2 GiB of experts: 6.8 GiB in RAM (auto), 0.0 GiB in VRAM, the rest read from disk; quality exact`.
+
+The flags are read by the programs that use the common arguments (`llama-server`, `llama-cli`,
+`llama-perplexity`, ...). For others, such as `llama-bench`, the same settings are environment variables:
+`LA_EXPERT_CACHE`, `LA_EXPERTS_RAM`, `LA_EXPERTS_VRAM` and `LA_RECIPE_LEVEL`.
+
+Measured settings per model family are kept as recipes (`recipes/README.md`), found in the `recipes`
+folder of the source tree or at `LA_RECIPES=path/to/recipes`. They give the usage profile (which
+experts to load first) and what each quality level does on that family.
+
+## Tuning by hand
+
+Everything below is for experiments and measurements. Setting `LA_ENABLE` (to 1 or 0) switches the
+automatic choice off: the variables are then used as given, as fractions of the routed experts.
+
 
 | variable | meaning |
 |---|---|
-| `LA_ENABLE=1` | turn the load-aware selection on |
+| `LA_ENABLE=1` | turn the load-aware selection on (0: off), with no automatic choice |
 | `LA_REAL=1` | real cache: resident experts in the engine's own memory, the rest read from the file with unbuffered I/O. Without it residency is only modelled (for quality measurements; needs the whole model in RAM or page cache) |
 | `LA_RESIDENT_FRAC=0.58` | share of the routed experts kept in RAM (0 to 1) |
 | `LA_BETA=0.25` | bias toward resident experts, in units of the router's top-k probability range. 0 = exactly what the router asks for. Most of the speed is won by 0.25; quality collapses between 1.0 and 1.5 on both models tried |

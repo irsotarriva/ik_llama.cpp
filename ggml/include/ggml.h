@@ -2512,6 +2512,9 @@ extern "C" {
     // load-aware expert selection (see ggml-moe-la.h): like ggml_top_k over router
     // probabilities, but entries may be -1 (dropped) and the choice depends on residency
     GGML_API bool ggml_moe_la_active(void);
+    // memory the system could give a program now, and all of it, in bytes (0 if unknown)
+    GGML_API uint64_t ggml_moe_la_mem_available(void);
+    GGML_API uint64_t ggml_moe_la_mem_total(void);
     // real mode (LA_REAL=1): the selector owns the memory of the routed experts
     GGML_API bool ggml_moe_la_real_active(void);
     GGML_API bool ggml_moe_la_take_tensor(int layer, struct ggml_tensor * tensor, const char * path, uint64_t file_offset);

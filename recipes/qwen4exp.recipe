@@ -6,7 +6,6 @@
 # 'saved' is the share of exact routing's disk reads avoided, worst case.
 match arch=qwen4exp n_expert=512
 default balanced
-LA_ENABLE=1
 LA_PROFILE=profiles/qwen3.8-flash-next.f32
 
 [exact]
