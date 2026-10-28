@@ -558,6 +558,8 @@ struct gpt_params {
 
     bool prefill_assistant    = true;
     bool dry_run              = false;
+    std::string config_file   = "";    // --config: the expert cache and disk prompt cache settings (la-config.h)
+    bool print_config         = false; // --print-config: print the resolved config and exit
 
     std::vector<std::string> api_keys;
 

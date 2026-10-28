@@ -17,7 +17,8 @@ routed experts that run on the CPU:
 | flag | meaning |
 |---|---|
 | `--experts-ram SIZE` | RAM for the routed experts, such as `24G` or `512M`. Default `auto`: the memory free at load, less the other weights and a reserve of the larger of 10% and 2 GiB, which is kept free while the model runs |
-| `--experts-vram SIZE` | VRAM for the most used experts, such as `4G` (default 0). Put the dense layers on the GPU and the experts on the CPU: `-ngl 99 --cpu-moe` |
+| `--experts-vram SIZE` | VRAM for the most used experts, such as `4G`, or one value per GPU in device order (`6G,0`). Default `auto`: what the main GPU has left once its weights, KV cache and compute buffers are counted, less `--experts-vram-margin`. Used only when the cache is on, and only with a usage profile (a recipe gives one). Put the dense layers on the GPU and the experts on the CPU: `-ngl 99 --cpu-moe` |
+| `--experts-vram-margin SIZE` | VRAM the auto budget leaves free on each GPU, one value or one per GPU. Default 1 GiB on a GPU that drives a display (the Windows driver quietly moves memory to system RAM when the card is full, which slows everything down) and 512 MiB on others |
 | `--quality LEVEL` | `exact` (default): always the router's experts. `near`, `balanced`, `fast`: a token may be served an expert already in memory instead of one that would be read from disk, for less quality and fewer reads. Only matters when experts are read from disk |
 | `--expert-cache MODE` | `auto` (default), `on` (also when everything fits, for recording a usage profile) or `off` (never; the engine as ik_llama.cpp) |
 
@@ -28,6 +29,7 @@ llama-server -m model.gguf                                   # auto: on only if 
 llama-server -m model.gguf --experts-ram 20G --quality near  # 20 GiB for experts, may swap a few
 llama-server -m model.gguf -ngl 99 --cpu-moe --experts-vram 6G
 llama-server -m model.gguf --expert-cache off                # as ik_llama.cpp
+llama-server -m model.gguf --config engine.toml              # the same settings from a file
 ```
 
 Reading from disk needs the model memory-mapped (no `--no-mmap`). The log says what was chosen:
@@ -35,11 +37,72 @@ Reading from disk needs the model memory-mapped (no `--no-mmap`). The log says w
 
 The flags are read by the programs that use the common arguments (`llama-server`, `llama-cli`,
 `llama-perplexity`, ...). For others, such as `llama-bench`, the same settings are environment variables:
-`LA_EXPERT_CACHE`, `LA_EXPERTS_RAM`, `LA_EXPERTS_VRAM` and `LA_RECIPE_LEVEL`.
+`LA_EXPERT_CACHE`, `LA_EXPERTS_RAM`, `LA_EXPERTS_VRAM`, `LA_VRAM_MARGIN` and `LA_RECIPE_LEVEL`.
+
+A VRAM budget on a GPU other than the main one (`--main-gpu`) is refused for now: the expert slots
+live on the main GPU. Placing each layer's slots on the GPU that holds that layer is planned.
+
+With `--fit`, a VRAM budget given as a size is kept out of the fit, so the fit leaves that much free
+for the slots; the automatic budget takes what the fit leaves.
 
 Measured settings per model family are kept as recipes (`recipes/README.md`), found in the `recipes`
 folder of the source tree or at `LA_RECIPES=path/to/recipes`. They give the usage profile (which
 experts to load first) and what each quality level does on that family.
+
+## Config file
+
+The same settings can be kept in a TOML file, given with `--config engine.toml`. Every key is
+optional: one that is missing is chosen at load, as without the file. Flags given as well win over
+the file, and so do `LA_*` variables already set in the environment.
+
+```toml
+version = 1
+
+[experts]
+cache   = "auto"        # --expert-cache: auto, on or off
+quality = "exact"       # --quality: exact, near, balanced or fast
+ram     = "auto"        # --experts-ram: auto or a size ("24G"; a number is GiB)
+
+[devices.CUDA0]         # one section per GPU, named as the backend names it (CUDA0, CUDA1, ...)
+vram        = "auto"    # --experts-vram
+vram_margin = "1G"      # --experts-vram-margin
+
+[cache_disk]            # the server's prompt cache on disk
+dir = "prompt-cache"    # --cache-disk (relative to the file's folder)
+max = "20G"             # --cache-disk-max
+```
+
+`--print-config` reads the model's metadata (no weights), works out every setting the way a real
+start would, prints it as such a file and exits. Each automatic choice is filled in, with a comment
+on how it was made, so the output can be saved, edited and given back with `--config`:
+
+```
+llama-server -m LFM2-24B-A2B-Q4_K_M.gguf -ngl 99 --cpu-moe --experts-ram 6G --print-config > engine.toml
+```
+
+```toml
+[experts]
+# auto: the 12.9 GiB of experts do not fit the 6.0 GiB of RAM for them, the rest is read from disk
+cache = "on"
+quality = "exact"
+ram = "6G"
+
+[devices.CUDA0]   # NVIDIA GeForce RTX 3060
+# auto: 11.0 GiB free, less 0.5 GiB of weights, 2.6 GiB of KV cache and compute buffers and a 1G margin (it drives a display)
+vram = "6.89G"
+vram_margin = "1G"
+```
+
+The KV cache counted is the one the context will allocate: with no `-c`, the model's full training
+context. The slots are sized by walking the usage profile's ranking with each expert's real size, so
+they stay within the budget when layers use different quantization types.
+
+A saved file pins the choices: the automatic ones are worked out again only for keys left out.
+Files ending in `.json` are read as JSON with the same layout, which is also the form a program can
+use to pass the config around.
+
+Unknown keys are errors, so a typo does not go unnoticed. `layers` tables (under `[experts]`, a device
+or at the top) are kept for placement per layer in a later version and are refused for now.
 
 ## Tuning by hand
 
