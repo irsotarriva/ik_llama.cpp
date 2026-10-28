@@ -774,6 +774,11 @@ extern "C" {
 
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
+    // The expert cache's settings as the first model load resolved them, every automatic choice filled
+    // in, as JSON in the layout of the config file (--config): {"experts": {...}, "devices": {"CUDA0":
+    // {...}}, "notes": {"experts.ram": "auto: ..."}, "summary": "..."}. Empty before a model is loaded.
+    LLAMA_API const char * llama_expert_cache_config(void);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,

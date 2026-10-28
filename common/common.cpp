@@ -10,6 +10,7 @@
 #endif
 
 #include "common.h"
+#include "la-config.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "llama-vocab.h"
@@ -928,6 +929,16 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         }
     }
 
+    // the config file fills in what no flag (and no LA_* variable) gave
+    if (!params.config_file.empty()) {
+        common_la_config cfg;
+        std::string err;
+        if (!common_la_config_load(params.config_file, cfg, err)) {
+            throw std::invalid_argument("error: --config " + err);
+        }
+        common_la_config_apply(cfg);
+    }
+
     if (params.fit && params.moe_cache_size > 0) {
         throw std::invalid_argument("error: --fit cannot be combined with --moe-cache-mib because fit does not reserve context-time cache memory");
     }
@@ -1327,8 +1338,21 @@ static void la_set_env(const char * name, const std::string & value) {
 
 // "24G", "24GB", "24GiB", "512M", "1.5T"; a plain number is GiB
 static bool la_size_ok(const std::string & s) {
-    static const std::regex re("^[0-9]*\\.?[0-9]+ *([gGmMtT]([iI]?[bB])?)?$");
-    return std::regex_match(s, re);
+    return common_la_size_ok(s);
+}
+
+// one value per GPU, comma separated, each a size (or auto where allowed), or name=value ("CUDA1=2G")
+static bool la_size_list_ok(const std::string & s, bool allow_auto) {
+    std::stringstream ss(s);
+    std::string item;
+    bool any = false;
+    while (std::getline(ss, item, ',')) {
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos) item = item.substr(eq + 1);
+        if (!(allow_auto && item == "auto") && !la_size_ok(item)) return false;
+        any = true;
+    }
+    return any;
 }
 
 bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_params & params, int & i, bool & invalid_param) {
@@ -2408,16 +2432,37 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         la_set_env("LA_EXPERT_CACHE", v);
         return true;
     }
-    if (arg == "--experts-ram" || arg == "--experts-vram") {
+    if (arg == "--experts-ram") {
         CHECK_ARG
         const std::string v = argv[i];
-        if (!(arg == "--experts-ram" && v == "auto") && !la_size_ok(v)) {
-            fprintf(stderr, "error: %s takes a size such as 24G or 512M%s, not '%s'\n", arg.c_str(),
-                    arg == "--experts-ram" ? ", or auto" : "", v.c_str());
+        if (v != "auto" && !la_size_ok(v)) {
+            fprintf(stderr, "error: --experts-ram takes a size such as 24G or 512M, or auto, not '%s'\n", v.c_str());
             invalid_param = true;
             return true;
         }
-        la_set_env(arg == "--experts-ram" ? "LA_EXPERTS_RAM" : "LA_EXPERTS_VRAM", v);
+        la_set_env("LA_EXPERTS_RAM", v);
+        return true;
+    }
+    if (arg == "--experts-vram" || arg == "--experts-vram-margin") {
+        CHECK_ARG
+        const std::string v = argv[i];
+        const bool vram = arg == "--experts-vram";
+        if (!la_size_list_ok(v, vram)) {
+            fprintf(stderr, "error: %s takes a size such as 4G%s, or one per GPU such as 6G,2G, not '%s'\n", arg.c_str(),
+                    vram ? " or auto" : "", v.c_str());
+            invalid_param = true;
+            return true;
+        }
+        la_set_env(vram ? "LA_EXPERTS_VRAM" : "LA_VRAM_MARGIN", v);
+        return true;
+    }
+    if (arg == "--config") {
+        CHECK_ARG
+        params.config_file = argv[i];
+        return true;
+    }
+    if (arg == "--print-config") {
+        params.print_config = true;
         return true;
     }
     if (arg == "--quality") {
@@ -3674,11 +3719,19 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                          "from disk; on: always; off: never (default: auto)" });
     options.push_back({ "*",           "       --experts-ram SIZE",      "RAM for routed experts that run on the CPU, such as 24G (default: auto, what is free\n"
                                                                          "less the other weights and a reserve)" });
-    options.push_back({ "*",           "       --experts-vram SIZE",     "VRAM for the most used of those experts, such as 4G (default: 0)" });
+    options.push_back({ "*",           "       --experts-vram SIZE",     "VRAM for the most used of those experts, such as 4G, or one per GPU in device order\n"
+                                                                         "such as 6G,0 (default: auto, what the main GPU has left after its weights, KV cache,\n"
+                                                                         "compute buffers and --experts-vram-margin; budgets on other GPUs are not supported yet)" });
+    options.push_back({ "*",           "       --experts-vram-margin SIZE", "VRAM the auto budget leaves free per GPU (default: 1G on a GPU that drives a display,\n"
+                                                                         "512M on others)" });
     options.push_back({ "*",           "       --quality LEVEL",         "exact: always the router's experts; near, balanced, fast: may serve an expert already in\n"
                                                                          "memory instead of reading one, for less quality (default: exact)" });
     options.push_back({ "*",           "       --cache-disk DIR",        "server: keep prompt states that clients mark with a ttl in DIR (default: none)" });
     options.push_back({ "*",           "       --cache-disk-max SIZE",   "server: size limit of --cache-disk (default: 20G)" });
+    options.push_back({ "*",           "       --config FILE",           "read the settings above from a TOML file ([experts], [devices.CUDA0], [cache_disk]);\n"
+                                                                         "flags given as well win over it (see LOAD_AWARE.md)" });
+    options.push_back({ "*",           "       --print-config",          "read the model's metadata, print the resolved settings as a config file with every\n"
+                                                                         "automatic choice filled in, and exit" });
     options.push_back({ "backend" });
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
@@ -4505,6 +4558,13 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         return iparams;
     }
 
+    if (params.print_config) {
+        fputs(common_la_config_resolved_toml(params.model).c_str(), stdout);
+        fflush(stdout);
+        llama_free_model(model);
+        exit(0);
+    }
+
     llama_init_sampler_from_model(model, params.sparams);
 
     // a predictor-only MTP GGUF has no main blocks, so it cannot be the target model
@@ -4698,7 +4758,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
         mparams.n_gpu_layers = params.n_gpu_layers;
     }
     mparams.mla             = params.mla_attn;
-    mparams.dry_run         = params.dry_run;
+    mparams.dry_run         = params.dry_run || params.print_config;   // --print-config reads no weight
     mparams.rpc_servers     = params.rpc_servers.c_str();
     mparams.main_gpu        = params.main_gpu;
     mparams.max_gpu         = params.max_gpu;

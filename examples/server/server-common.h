@@ -68,6 +68,7 @@ enum error_type {
 
 extern bool server_verbose;
 extern bool server_log_json;
+extern bool server_log_stderr;   // --print-config: stdout is for the config
 
 #ifndef SERVER_VERBOSE
 #define SERVER_VERBOSE 1

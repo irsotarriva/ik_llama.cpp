@@ -15,6 +15,10 @@ experts do not fit in RAM, everything else is off unless a client asks for it, a
   larger than RAM run at usable speed. On by default, and only when the experts do not fit in RAM; at
   the default quality, `exact`, the output is the same as with the whole model in memory.
   Flags: `--experts-ram`, `--experts-vram`, `--quality`, `--expert-cache`; see [LOAD_AWARE.md](LOAD_AWARE.md).
+- **Config file.** The same settings, per GPU where they apply, in a TOML file given with
+  `--config engine.toml`; every key is optional and flags win over it. `--print-config` prints the
+  settings a start would use, every automatic choice filled in, as such a file:
+  [LOAD_AWARE.md](LOAD_AWARE.md#config-file).
 - **Recipes.** Measured settings per model family, picked from the model's metadata, at quality
   levels from `exact` to `fast`: [recipes/README.md](recipes/README.md).
 - **Prompt cache on disk, controlled by the client.** A client marks where checkpoints go and which
@@ -338,5 +342,6 @@ $ echo "source ~/.llama-completion.bash" >> ~/.bashrc
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
 - [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
+- [toml++](https://github.com/marzer/tomlplusplus) - Single-header TOML parser, used for `--config` - MIT License
 - [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain

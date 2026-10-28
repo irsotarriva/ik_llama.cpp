@@ -66,8 +66,9 @@ void server_log(const char* level, const char* function, int line, const char* m
 
         out = ss.str();
     }
-    printf("%s\n", out.c_str());
-    fflush(stdout);
+    FILE * dst = server_log_stderr ? stderr : stdout;
+    fprintf(dst, "%s\n", out.c_str());
+    fflush(dst);
 
     // Mirror to --log-file when explicitly set (see log_target_changed()).
     if (log_target_changed()) {

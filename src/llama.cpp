@@ -4335,7 +4335,7 @@ struct expert_tensors {
 static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_loader & ml, const llama_model & model,
         ggml_type cache_type_k, ggml_type cache_type_v, ggml_type idx_type_k, uint32_t max_ctx_size, int mla_attn, int n_seq_max, int n_ubatch,
         int amb, int worst_case_tokens, bool flash_attn, bool swa_compress,
-        std::vector<expert_tensors> & experts) {
+        std::vector<expert_tensors> & experts, std::vector<double> * cache_sizes = nullptr) {
     int n_layer = model.hparams.n_layer;
     // looped models have one KV slot per logical layer
     const double kv_loops = model.hparams.n_layer_all > (uint32_t) n_layer
@@ -4568,6 +4568,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
         tot_model += result[il];
         tot_cache += kv_size;
         result[il] += kv_size;
+        if (cache_sizes) cache_sizes->push_back(kv_size);
     }
     int n_output = worst_case_tokens > 0 ? worst_case_tokens : n_ubatch;
     size_t output_size = model.hparams.n_vocab * n_output * sizeof(float);
@@ -4576,6 +4577,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
     LLAMA_LOG_INFO("Layer %2d: %9.2f, %9.2f, %9.2f MiB (output layer)\n", n_layer, result[n_layer]/1024./1024., output_size/1024./1024., (result[n_layer] + output_size)/1024./1024.);
     result[n_layer] += output_size;
     tot_cache += output_size;
+    if (cache_sizes) cache_sizes->push_back(output_size);
     LLAMA_LOG_INFO("--------------------------------------------------------------------------\n");
     LLAMA_LOG_INFO("Total   : %9.2f, %9.2f, %9.2f MiB\n", tot_model/1024./1024., tot_cache/1024./1024., (tot_model + tot_cache)/1024./1024.);
     return std::make_pair(std::move(result), max_compute);
@@ -4788,6 +4790,22 @@ static bool llm_load_tensors(
     if (fit && device_count > 1) {
         model.main_gpu = device_count - 1;
     }
+    if (fit && !model.devices.empty()) {
+        // the expert cache's VRAM budgets given as sizes are not the fit's to use
+        const auto given = llama_la_vram_given((int) model.devices.size(), model.main_gpu);
+        for (int i = 0; i < (int) given.size() && i < (int) device_mem.size(); ++i) {
+            if (given[i] == 0) continue;
+            LLAMA_LOG_INFO("%s: --fit leaves %.0f MiB on GPU %d for the expert cache's VRAM tier (--experts-vram)\n",
+                           __func__, given[i]/1024./1024., i);
+            device_mem[i] = device_mem[i] > given[i] ? device_mem[i] - given[i] : 0;
+        }
+    }
+    // free memory per GPU before any weight is loaded, and the KV cache and compute buffers each layer
+    // will add, for the expert cache's VRAM budget (llama_la_decide)
+    std::vector<size_t> la_free(model.devices.size());
+    for (int i = 0; i < int(model.devices.size()); ++i) la_free[i] = llama_get_device_memory(model, model.devices[i]);
+    std::vector<double> la_cache_sizes;
+    double la_compute = 0;
 
     if (model.is_mla_model()) {
         if (model.n_gpu_layers > 0 && model.n_gpu_layers < model.hparams.n_layer && mla_attn != 3) {
@@ -4810,7 +4828,8 @@ static bool llm_load_tensors(
     if (device_count > 0 && !model.devices.empty()) {
         std::vector<expert_tensors> experts;
         auto [layer_sizes, max_compute] = get_layer_sizes(ml, model, cache_type_k, cache_type_v, idx_type_k, max_ctx_size, mla_attn, n_seq_max, n_ubatch,
-                amb, worst_case_tokens, flash_attn, swa_compress, experts);
+                amb, worst_case_tokens, flash_attn, swa_compress, experts, &la_cache_sizes);
+        la_compute = max_compute;
         size_t required_mem = 0;
         for (int i = 0; i <= n_layer; ++i) {
             required_mem += layer_sizes[i];
@@ -5179,7 +5198,43 @@ static bool llm_load_tensors(
 
     // every weight has its place and none is read yet: decide whether the expert cache runs, before
     // anything asks it (the mappings below are not prefetched when it reads from disk)
-    if (!dry_run) llama_la_decide(model, ml.use_mmap, ctx_map);
+    {
+        llama_la_gpus gpus;
+        // a build without a GPU backend lists the CPU as its device: no GPU then
+        auto buft0 = model.devices.empty() ? nullptr : llama_default_buffer_type_offload(model, model.devices[0]);
+        const int n_dev = buft0 && !ggml_backend_buft_is_host(buft0) ? (int) model.devices.size() : 0;
+        gpus.main       = std::clamp(model.main_gpu, 0, std::max(0, n_dev - 1));
+        gpus.offloading = n_dev > 0 && n_gpu_layers > 0 && i_gpu_start < n_layer;
+        gpus.reserve.assign(n_dev, 0);
+        std::vector<bool> has_layer(n_dev, false);
+        auto add = [&](int il, double bytes) {
+            int d = il < (int) model.default_layer_device.size() ? model.default_layer_device[il] : -1;
+            if (d < 0 || d >= n_dev) return;
+            gpus.reserve[d] += (uint64_t) bytes;
+            has_layer[d] = true;
+        };
+        for (int il = i_gpu_start; il < n_layer && il < (int) la_cache_sizes.size(); ++il) add(il, la_cache_sizes[il]);
+        if (n_gpu_layers > n_layer && (int) la_cache_sizes.size() > n_layer) add(n_layer, la_cache_sizes[n_layer]);
+        for (int i = 0; i < n_dev; ++i) {
+            if (has_layer[i]) gpus.reserve[i] += (uint64_t) la_compute;
+            auto buft = llama_default_buffer_type_offload(model, model.devices[i]);
+            gpus.device.push_back(model.devices[i]);
+            gpus.buft.push_back(buft);
+            gpus.name.push_back(buft ? ggml_backend_buft_name(buft) : "GPU" + std::to_string(i));
+            gpus.free.push_back(i < (int) la_free.size() ? la_free[i] : 0);
+            bool display = false;
+            std::string desc;
+#ifdef GGML_USE_CUDA
+            char d[256] = {};
+            ggml_backend_cuda_get_device_description(model.devices[i], d, sizeof(d));
+            desc    = d;
+            display = ggml_backend_cuda_drives_display(model.devices[i]);
+#endif
+            gpus.desc.push_back(desc);
+            gpus.display.push_back(display);
+        }
+        llama_la_decide(model, ml.use_mmap, ctx_map, gpus, /*apply =*/ !dry_run);
+    }
 
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
     ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run

@@ -79,6 +79,7 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 
 bool server_verbose = false;
 bool server_log_json = true;
+bool server_log_stderr = false;
 
 
 enum server_state {
@@ -505,6 +506,7 @@ int main(int argc, char ** argv) {
     // TODO: not great to use extern vars
     server_log_json = params.log_json;
     server_verbose = params.verbosity > 0;
+    server_log_stderr = params.print_config;
 
 
     // struct that contains llama context and inference

@@ -5653,6 +5653,18 @@ GGML_CALL bool ggml_backend_cuda_is_integrated(int device) {
     return ggml_cuda_info().devices[device].integrated;
 }
 
+GGML_CALL bool ggml_backend_cuda_drives_display(int device) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return false;
+    }
+    int timeout = 0;
+    if (cudaDeviceGetAttribute(&timeout, cudaDevAttrKernelExecTimeout, device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return timeout != 0;
+}
+
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
