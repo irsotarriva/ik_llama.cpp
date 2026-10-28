@@ -195,8 +195,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int32_t target_vocab_size = llama_vocab_n_tokens(vocab_tgt);
         const int32_t target_hidden_size = llama_model_n_embd(model_tgt);
         const int32_t draft_hidden_size = llama_model_n_embd(model_dft);
+        const int32_t target_streams = llama_model_dflash_target_streams(model_tgt);
         const int32_t target_mask_token_id = llama_model_dflash_target_mask_token_id(model_tgt);
-        const int32_t expected_n_target_features = target_hidden_size > 0 ? target_hidden_size * n_target_layers : 0;
+        const int32_t expected_n_target_features = target_hidden_size > 0
+                ? target_hidden_size * target_streams * n_target_layers
+                : 0;
 
         if (target_mask_token_id != (int32_t) LLAMA_TOKEN_NULL && mask_token_id != target_mask_token_id) {
             LOG_ERR("%s: DFlash mask token mismatch (draft=%d target=%d)\n",
@@ -373,6 +376,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
             common_batch_add(batch, mask_token_id, draft_pos_base + i, { 0 }, output_mask_rows);
         }
 
+        llama_set_dflash_want_logits(ctx_dft, params.p_min > 0.0f);
+
         const int decode_status = llama_decode(ctx_dft, batch);
         if (cache_plan.rebuild_cache) {
             rebuild_count++;
@@ -455,11 +460,20 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         result.reserve((size_t) n_keep);
+        const bool want_prob = params.p_min > 0.0f;
         for (int32_t i = 0; i < n_keep; ++i) {
             llama_token id = llama_get_dflash_draft_token_ith(ctx_dft, i);
-            if (id == LLAMA_TOKEN_NULL) {
+            float prob = 1.0f;
+            if (id == LLAMA_TOKEN_NULL || want_prob) {
                 const int32_t logits_idx = is_dspark ? i : i + 1;
-                id = common_sampler_sample_speculative(nullptr, ctx_dft, logits_idx, nullptr);
+                const llama_token sampled = common_sampler_sample_speculative(nullptr, ctx_dft,
+                        logits_idx, want_prob ? &prob : nullptr);
+                if (id == LLAMA_TOKEN_NULL) {
+                    id = sampled;
+                }
+            }
+            if (i > 0 && want_prob && prob < params.p_min) {
+                break;
             }
             result.push_back(id);
         }

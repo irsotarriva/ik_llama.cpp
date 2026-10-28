@@ -739,6 +739,12 @@ class GGUFWriter:
     def add_sliding_window_pattern(self, value: Sequence[bool]) -> None:
         self.add_array(Keys.Attention.SLIDING_WINDOW_PATTERN.format(arch=self.arch), value)
 
+    def add_rope_pattern(self, value: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
+
+    def add_swiglu_clamp_exp(self, values: Sequence[float]) -> None:
+        self.add_array(Keys.LLM.SWIGLU_CLAMP_EXP.format(arch=self.arch), values)
+
     def add_dense_features_dims(self, dense:str, in_f:int, out_f:int) -> None:
         self.add_uint32(Keys.LLM.DENSE_FEAT_IN_SIZE.format(arch=self.arch, dense=dense), in_f)
         self.add_uint32(Keys.LLM.DENSE_FEAT_OUT_SIZE.format(arch=self.arch, dense=dense), out_f)
@@ -955,6 +961,30 @@ class GGUFWriter:
 
     def add_ssm_dt_b_c_rms(self, value: bool) -> None:
         self.add_bool(Keys.SSM.DT_B_C_RMS.format(arch=self.arch), value)
+
+    def add_kda_head_dim(self, value: int) -> None:
+        self.add_uint32(f"{self.arch}.kda.head_dim", value)
+
+    def add_kda_gate_lower_bound(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.kda.gate_lower_bound", value)
+
+    def add_latent_norm_rms_eps(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.attention.latent_norm_rms_epsilon", value)
+
+    def add_activation_situ_beta(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.activation.situ_beta", value)
+
+    def add_activation_situ_linear_beta(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.activation.situ_linear_beta", value)
+
+    def add_hyper_connection_count(self, value: int) -> None:
+        self.add_uint32(f"{self.arch}.hyper_connection.count", value)
+
+    def add_hyper_connection_epsilon(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.hyper_connection.epsilon", value)
+
+    def add_hyper_connection_magnitude(self, value: float) -> None:
+        self.add_float32(f"{self.arch}.hyper_connection.magnitude", value)
 
     def add_tokenizer_model(self, model: str) -> None:
         self.add_string(Keys.Tokenizer.MODEL, model)

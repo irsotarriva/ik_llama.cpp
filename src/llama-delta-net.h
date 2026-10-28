@@ -22,7 +22,7 @@ struct delta_net {
             uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb,
             bool external_residual = false, ggml_unary_op gate_op = GGML_UNARY_OP_SILU) const;
 
-    // external_residual: the caller has already normalised the input and owns the residual
+    // external_residual: the caller has already normalized the input and owns the residual
     // add, as a hyper-connection stack does. The layer then returns just its own output.
     ggml_tensor * build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
@@ -68,7 +68,8 @@ private:
             int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
             int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
             float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-            ggml_tensor * per_step_ssm = nullptr, ggml_tensor * per_step_conv = nullptr);
+            ggml_tensor * per_step_ssm = nullptr, ggml_tensor * per_step_conv = nullptr,
+            ggml_tensor * rda_delta = nullptr);
 
     // gate_op selects the output gate: SiLU for the Qwen3-Next family, SIGMOID for qwen4exp
     static ggml_tensor * build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out,

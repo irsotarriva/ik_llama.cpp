@@ -2,6 +2,7 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 
+#include <algorithm>
 #include <vector>
 
 // Per-rank attention for DEEPSEEK2 under -sm graph (requires -fa + -mla>=1).
@@ -108,6 +109,14 @@ ggml_tensor * llm_build_context::build_deepseek2_tp_attention(
         if (rope_cache) {
             q_rope = ggml_rope_fast(ctx0, q_rope, rope_cache);
             k_rope = ggml_rope_fast(ctx0, k_rope, rope_cache);
+        } else if (hparams.use_mrope()) {
+            // BailingMoe3-VL: mrope sections over the rotary part of Q/K
+            int sections[4];
+            std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+            q_rope = ggml_rope_multi(ctx0, q_rope, inp_pos, nullptr, n_rot, sections, rope_type,
+                    n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor_scaled, beta_fast, beta_slow);
+            k_rope = ggml_rope_multi(ctx0, k_rope, inp_pos, nullptr, n_rot, sections, rope_type,
+                    n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor_scaled, beta_fast, beta_slow);
         } else {
             q_rope = ggml_rope_ext(ctx0, q_rope, inp_pos, nullptr, n_rot, rope_type,
                     n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor_scaled, beta_fast, beta_slow);
@@ -868,6 +877,14 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
         if (rope_cache) {
             q_rope = ggml_rope_fast(ctx0, q_rope, rope_cache);
             k_rope = ggml_rope_fast(ctx0, k_rope, rope_cache);
+        } else if (hparams.use_mrope()) {
+            // BailingMoe3-VL: mrope sections over the rotary part of Q/K
+            int sections[4];
+            std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+            q_rope = ggml_rope_multi(ctx0, q_rope, inp_pos, nullptr, n_rot, sections, rope_type,
+                    n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor_scaled, beta_fast, beta_slow);
+            k_rope = ggml_rope_multi(ctx0, k_rope, inp_pos, nullptr, n_rot, sections, rope_type,
+                    n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor_scaled, beta_fast, beta_slow);
         } else {
             q_rope = ggml_rope_ext(ctx0, q_rope, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor_scaled, beta_fast, beta_slow);
@@ -1426,7 +1443,24 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
         inpL = cur;
     }
 
-    cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+    if (lctx.cparams.mtp) {
+        ggml_tensor * mtp_hidden = llm_build_norm(ctx0, inpL, hparams, model.output_norm,
+                nullptr, LLM_NORM_RMS, cb, -1);
+        cb(mtp_hidden, "result_norm", -1);
+        ggml_set_output(mtp_hidden);
+
+        if (n_outputs == 0) {
+            ggml_build_forward_expand(gf, mtp_hidden);
+            return gf;
+        }
+
+        if (mtp_hidden->ne[1] > n_outputs) {
+            mtp_hidden = ggml_get_rows(ctx0, mtp_hidden, build_inp_out_ids());
+        }
+        cur = build_output(lctx, ctx0, mtp_hidden, model.output, cb);
+    } else {
+        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+    }
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);
@@ -1447,6 +1481,8 @@ struct ggml_tensor * llm_build_context::build_deepseek2_mtp(
 #endif
 
     const int il = hparams.n_layer - 1;
+    const bool emit_logits = lctx.cparams.mtp_op_type == MTP_OP_DRAFT_GEN ||
+                             lctx.cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED;
 
     const uint32_t n_embd_head_k_mtp   = hparams.n_embd_head_k(il);
 
@@ -1475,6 +1511,10 @@ struct ggml_tensor * llm_build_context::build_deepseek2_mtp(
     cur = build_deepseek2_layer_attention(gf, il, cur, KQ_mask, inp_pos, nullptr,
                                                   kq_scale, attn_factor_scaled,
                                                   use_f32_attn_precision, false, false);
+
+    if (!emit_logits) {
+        return cur;
+    }
 
     // Residual + FFN
     ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);

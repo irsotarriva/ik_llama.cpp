@@ -78,6 +78,7 @@ models = [
     {"name": "refact",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/smallcloudai/Refact-1_6-base", },
     {"name": "command-r",      "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/CohereForAI/c4ai-command-r-v01", },
     {"name": "qwen2",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Qwen/Qwen1.5-7B", },
+    {"name": "flint",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/RecursiveSI/flint-preview", "chkhsh": "d5420e601e979078c670bc503d9ac411c311fa76b76a76267c31e0d6ba816637", },
     {"name": "qwen35",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Qwen/Qwen3.5-9B-Instruct", "chkhsh": "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4", },
     {"name": "qwen35",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Qwen/Qwen3.5-27B", "chkhsh": "99cc61242f7106804ce24fdf3a6451e4a55251078dffd5453c806e11b2310db3", },
     {"name": "qwen35",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/z-lab/Qwen3.5-27B-DFlash", "chkhsh": "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f", },
@@ -110,6 +111,8 @@ models = [
     {"name": "openpangu",      "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/openpangu/openPangu-2.0-Flash", "chkhsh": "65df2fe396b537a53433301848c0a739f56d56f67ad3d35eba27961ac33c12bb", },  # primary source: https://gitcode.com/ascend-tribe/openPangu-2.0-Flash
     {"name": "lfm2",             "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2-Tokenizer"},
     {"name": "lfm2",             "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B"},
+    # raon: NFC normalizer + CJK-aware split regex
+    {"name": "raon",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/KRAFTON/Raon-1-mini-preview", "chkhsh": "ffdae2f611dc6903980be2fbb108467cb97376d7d03cd332bb7e2602f87fa1f1"},
 ]
 
 

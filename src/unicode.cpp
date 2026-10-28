@@ -1067,8 +1067,75 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
     return bpe_offsets;
 }
 
+static std::vector<size_t> unicode_regex_split_custom_raon(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+    std::vector<size_t> result;
+    size_t begin = 0;
+    for (size_t offset : offsets) {
+        const size_t end = begin + offset;
+        auto flags = [&](size_t p) { return p < end ? unicode_cpt_flags_from_cpt(cpts[p]) : unicode_cpt_flags{}; };
+        auto cjk = [&](size_t p) {
+            return p < end && ((cpts[p] >= 0x4e00 && cpts[p] <= 0x9fa5) || (cpts[p] >= 0x3040 && cpts[p] <= 0x30ff));
+        };
+        auto letter = [&](size_t p) { return flags(p).is_letter && !cjk(p); };
+        for (size_t pos = begin; pos < end;) {
+            const size_t start = pos;
+            size_t p = pos + (cpts[pos] == ' ');
+            if (cjk(p)) {
+                do { ++p; } while (cjk(p));
+                pos = p;
+            } else if (letter(p)) {
+                do {
+                    ++p;
+                    while (flags(p).is_accent_mark) { ++p; }
+                    if (letter(p)) { continue; }
+                    if (p < end && cpts[p] == ' ' && letter(p + 1)) { ++p; continue; }
+                    break;
+                } while (true);
+                pos = p;
+            } else if (flags(pos).is_number) {
+                p = pos;
+                while (flags(p).is_number) { ++p; }
+                const size_t first = (p - pos) % 3;
+                pos += first ? first : 3;
+            } else {
+                auto punct = [&](size_t q) {
+                    const auto f = flags(q);
+                    return q < end && !f.is_whitespace && !f.is_letter && !f.is_number;
+                };
+                if (punct(p)) {
+                    do { ++p; } while (punct(p));
+                    while (p < end && (cpts[p] == '\r' || cpts[p] == '\n' || cpts[p] == '/')) { ++p; }
+                    pos = p;
+                } else {
+                    p = pos;
+                    size_t last_newline = pos;
+                    while (flags(p).is_whitespace) {
+                        if (cpts[p] == '\r' || cpts[p] == '\n') { last_newline = p + 1; }
+                        ++p;
+                    }
+                    if (last_newline > pos) {
+                        pos = last_newline;
+                    } else if (p > pos) {
+                        pos = p < end && p - pos > 1 ? p - 1 : p;
+                    } else {
+                        ++pos;
+                    }
+                }
+            }
+            result.push_back(pos - start);
+        }
+        begin = end;
+    }
+    return result;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
+
+    if (regex_expr.find("\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))") != std::string::npos) {
+        return unicode_regex_split_custom_raon(text, offsets);
+    }
 
     if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
         bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
@@ -1090,6 +1157,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (regex_expr == "\\p{AFMoE_digits}") {
         // AFMOE digit pattern - use custom implementation for proper splitting
         bpe_offsets = unicode_regex_split_custom_afmoe(text, offsets);
+    } else if (regex_expr == " ?[一-龥぀-ヿ゠-ヿ]+| ?(?:(?:(?![一-龥぀-ヿ゠-ヿ])\\p{L})\\p{M}*)+(?: (?:(?:(?![一-龥぀-ヿ゠-ヿ])\\p{L})\\p{M}*)+)*|\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_raon(text, offsets);
     } else if (regex_expr == "[^\\n]+|[\\n]+") {
         bpe_offsets = unicode_regex_split_custom_newlines(text, offsets);
     } else if (regex_expr == "\\d{1,3}(?=(?:\\d{3})*\\b)") {
@@ -1145,6 +1214,99 @@ std::vector<uint32_t> unicode_cpts_normalize_nfd(const std::vector<uint32_t> & c
         const uint32_t cpt = cpts[i];
         auto it = std::upper_bound(unicode_ranges_nfd.begin(), unicode_ranges_nfd.end(), cpt, comp) - 1;
         result[i] = (it->first <= cpt && cpt <= it->last) ? it->nfd : cpt;
+    }
+    return result;
+}
+
+static uint8_t unicode_canonical_class(uint32_t cpt) {
+    const auto * end = unicode_combining_class + unicode_combining_class_count;
+    const auto it = std::lower_bound(unicode_combining_class, end, cpt,
+            [](const unicode_cpt_value & e, uint32_t v) { return e.cpt < v; });
+    return it != end && it->cpt == cpt ? (uint8_t) it->value : 0;
+}
+
+static void unicode_canonical_decompose(uint32_t cpt, std::vector<uint32_t> & result, std::vector<uint32_t> & pending) {
+    pending.push_back(cpt);
+    while (!pending.empty()) {
+        cpt = pending.back();
+        pending.pop_back();
+        // Hangul syllables use algorithmic decomposition (UAX #15).
+        if (cpt >= 0xAC00 && cpt < 0xAC00 + 11172) {
+            const uint32_t index = cpt - 0xAC00;
+            result.push_back(0x1100 + index / 588);
+            result.push_back(0x1161 + (index % 588) / 28);
+            if (index % 28) {
+                result.push_back(0x11A7 + index % 28);
+            }
+            continue;
+        }
+        const auto * end = unicode_decomposition + unicode_decomposition_count;
+        const auto it = std::lower_bound(unicode_decomposition, end, cpt,
+                [](const unicode_decomp_entry & e, uint32_t v) { return e.cpt < v; });
+        if (it == end || it->cpt != cpt) {
+            result.push_back(cpt);
+            continue;
+        }
+        if (it->second) {
+            pending.push_back(it->second);
+        }
+        pending.push_back(it->first);
+    }
+}
+
+static uint32_t unicode_canonical_compose(uint32_t first, uint32_t second) {
+    if (first >= 0x1100 && first < 0x1100 + 19 && second >= 0x1161 && second < 0x1161 + 21) {
+        return 0xAC00 + ((first - 0x1100) * 21 + second - 0x1161) * 28;
+    }
+    if (first >= 0xAC00 && first < 0xAC00 + 11172 && (first - 0xAC00) % 28 == 0 && second > 0x11A7 && second < 0x11A7 + 28) {
+        return first + second - 0x11A7;
+    }
+    const uint64_t key = (uint64_t(first) << 32) | second;
+    const auto * end = unicode_composition + unicode_composition_count;
+    const auto it = std::lower_bound(unicode_composition, end, key,
+            [](const unicode_comp_entry & e, uint64_t k) { return e.key < k; });
+    return it != end && it->key == key ? it->value : 0;
+}
+
+std::vector<uint32_t> unicode_cpts_normalize_nfc(const std::vector<uint32_t> & cpts) {
+    std::vector<uint32_t> decomposed;
+    decomposed.reserve(cpts.size());
+    std::vector<uint32_t> pending;
+    for (const uint32_t cpt : cpts) {
+        unicode_canonical_decompose(cpt, decomposed, pending);
+    }
+
+    // Sort each run of combining marks; equal classes retain their order.
+    for (size_t i = 0; i < decomposed.size();) {
+        if (unicode_canonical_class(decomposed[i]) == 0) {
+            ++i;
+        }
+        const size_t begin = i;
+        while (i < decomposed.size() && unicode_canonical_class(decomposed[i]) != 0) {
+            ++i;
+        }
+        std::stable_sort(decomposed.begin() + begin, decomposed.begin() + i, [](uint32_t a, uint32_t b) {
+            return unicode_canonical_class(a) < unicode_canonical_class(b);
+        });
+    }
+
+    std::vector<uint32_t> result;
+    result.reserve(decomposed.size());
+    size_t starter = 0;
+    uint8_t previous_class = 0;
+    for (const uint32_t cpt : decomposed) {
+        const uint8_t current_class = unicode_canonical_class(cpt);
+        const uint32_t composite = !result.empty() && (previous_class == 0 || previous_class < current_class)
+            ? unicode_canonical_compose(result[starter], cpt) : 0;
+        if (composite) {
+            result[starter] = composite;
+        } else {
+            if (current_class == 0) {
+                starter = result.size();
+            }
+            result.push_back(cpt);
+            previous_class = current_class;
+        }
     }
     return result;
 }

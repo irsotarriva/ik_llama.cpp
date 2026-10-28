@@ -3,7 +3,7 @@
 #include "../mmq_id_common.cuh"
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq5_ks(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride, [[maybe_unused]] int blocks_per_ne00) {
 
     constexpr int nwarps = mmq_get_nwarps_device();
 
@@ -60,13 +60,13 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 #ifdef INT8_MMA_AVAILABLE
         x_df[i*MMQ_MMA_TILE_X_K_Q8_0               + kqsx] = d * ((bxi->scales[kqsx] & 254) - 127);
 #else
-        x_df[i*(2*WARP_SIZE*2/QI8_0) + i/(QI8_0/4) + kqsx] = d * ((bxi->scales[kqsx] & 254) - 127);
+        x_df[i*(WARP_SIZE/4) + i/4   + kqsx] = d * ((bxi->scales[kqsx] & 254) - 127);
 #endif // INT8_MMA_AVAILABLE
     }
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq5_ks_r4(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride, [[maybe_unused]] int blocks_per_ne00) {
 
     constexpr int nwarps = mmq_get_nwarps_device();
 

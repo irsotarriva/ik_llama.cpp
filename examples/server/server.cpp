@@ -621,7 +621,7 @@ int main(int argc, char ** argv) {
             sqlite3_free(errmsg);
             LOG_WARNING("Failed to load extension", {{"err", err}});
         }
-	else {
+        else {
             sqlite_extension_loaded = true;
         }
         sqlite3_enable_load_extension(conn, 0);
@@ -1631,6 +1631,79 @@ int main(int argc, char ** argv) {
         handle_embeddings_impl(req, res, OAICOMPAT_TYPE_EMBEDDING);
     };
 
+    const auto handle_systemone = [&ctx_server, &params](const httplib::Request & req, httplib::Response & res) {
+        const auto & decision = ctx_server.decision;
+        if (decision.type == COMMON_DECISION_TYPE_NONE) {
+            res_err(res, format_error_response("This model is not a decision model", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+
+        const json body = json::parse(req.body);
+        std::vector<server_decision_question> questions;
+        size_t n_images = 0;
+        try {
+            questions = decision.parse_questions(body);
+            n_images  = decision.count_images(body);
+        } catch (const std::invalid_argument & e) {
+            res_err(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (n_images > 0) {
+            res_err(res, format_error_response("This server does not support image input for decisions", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+        const json & state = body.at("state");
+
+        // one task per variant of each question
+        server_response_reader rd(ctx_server);
+        {
+            std::vector<server_task> tasks;
+            for (const auto & question : questions) {
+                for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
+                    server_task task = server_task(SERVER_TASK_TYPE_DECISION);
+                    task.id = ctx_server.queue_tasks.get_new_id();
+                    task.index = tasks.size();
+                    decision.fill_task(state, questions, question, variant, task);
+                    tasks.push_back(std::move(task));
+                }
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.is_connection_closed);
+
+        if (all_results.is_terminated) {
+            if (rd.any_task_on_slot()) llama_decode_stop();
+            return; // connection is closed
+        }
+        else if (all_results.error) {
+            res_err(res, all_results.error->to_json());
+            return;
+        }
+
+        json answers = json::object();
+        int32_t n_tokens = 0;
+        size_t i_result = 0;
+        for (const auto & question : questions) {
+            std::vector<std::vector<float>> scores;
+            for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
+                auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[i_result++].get());
+                GGML_ASSERT(result != nullptr);
+                scores.push_back(result->scores);
+                n_tokens += result->n_tokens;
+            }
+            answers[question.id] = decision.format_answer(question, scores);
+        }
+
+        res_ok(res, json{
+            {"model",   params.model_alias},
+            {"answers", answers},
+            {"usage",   {
+                {"input_tokens",  n_tokens},
+                {"output_tokens", 0},
+            }},
+        });
+    };
 
     const auto handle_lora_adapters_list = [&](const httplib::Request & req, httplib::Response & res) {
         json result = json::array();
@@ -1984,7 +2057,7 @@ int main(int argc, char ** argv) {
     auto db_handler = [db_handle](auto func) {
         return [func, db_handle](const httplib::Request& req, httplib::Response& res) {
             res.set_header("Access-Control-Allow-Origin", "*");
-	    try {
+            try {
                 const json body = !req.body.empty() ? json::parse(req.body) : json::object();
                 func(*db_handle, body, req, res);
             } catch(const std::exception& e) {
@@ -2031,14 +2104,14 @@ int main(int argc, char ** argv) {
 
     const auto handle_load = db_handler([normalize_store_name, get_key_string](auto& db, const json& body, auto&, auto& res) {
         std::string data;
-	const std::string store = normalize_store_name(body["storeName"]);
-	db.db << "SELECT data FROM " + store + " WHERE key = ?" << get_key_string(body["key"]) >> data;
-	if(data.empty()) {
+        const std::string store = normalize_store_name(body["storeName"]);
+        db.db << "SELECT data FROM " + store + " WHERE key = ?" << get_key_string(body["key"]) >> data;
+        if(data.empty()) {
             res.status = 404;
             res.set_content(json{{"ok", false}, {"message", "Key not found"}}.dump(), "application/json");
         } else {
             json response{{"ok", true}};
-	    response["result"] = (store == "names") ? json(data) : json::parse(data);
+            response["result"] = (store == "names") ? json(data) : json::parse(data);
             res.set_content(response.dump(), "application/json");
         }
     });
@@ -2099,7 +2172,7 @@ int main(int argc, char ** argv) {
         if (body["duration"].is_null()) {
             db.db << "select zstd_incremental_maintenance(?, ?)" <<  nullptr << body["db_load"].get<double>() >> data;
         }
-	else {
+        else {
             db.db << "select zstd_incremental_maintenance(?, ?)" << body["duration"].get<double>() << body["db_load"].get<double>() >> data;
         }
         json response{{"ok", true}};
@@ -2188,6 +2261,7 @@ int main(int argc, char ** argv) {
     svr->Post("/embedding",           handle_embeddings); // legacy
     svr->Post("/embeddings",          handle_embeddings);
     svr->Post("/v1/embeddings",       handle_embeddings_oai);
+    svr->Post("/v1/systemone",        handle_systemone);
     svr->Post("/tokenize",            handle_tokenize);
     // states the clients asked to keep on disk (README-cache.md): list, extend, delete
     svr->Get ("/cache", [&ctx_server](const httplib::Request &, httplib::Response & res) {
@@ -2258,7 +2332,7 @@ int main(int argc, char ** argv) {
             svr->Post("/zstd_incremental_maintenance", handle_zstd_maintenance);
             svr->Post("/zstd_enable_transparent", handle_zstd_enable);
             svr->Post("/zstd_update_transparent", handle_zstd_config_update);
-	}
+        }
 #endif
     }
 

@@ -382,7 +382,9 @@ struct llama_layer {
     struct ggml_tensor * ssm_beta_alpha = nullptr;
     struct ggml_tensor * ssm_alpha = nullptr;
     struct ggml_tensor * ssm_beta = nullptr;
+    struct ggml_tensor * ssm_rda = nullptr; // Raon-1: write gate offset
     struct ggml_tensor * ssm_f_a = nullptr;
+    struct ggml_tensor * ssm_g = nullptr; // Raon-1: full-rank output gate
     struct ggml_tensor * ssm_g_a = nullptr;
     // GLM-5.3-Flash (kimi-k3) low-rank KDA parameterization: f = f_b(f_a(x)), g = g_b(g_a(x))
     struct ggml_tensor * ssm_f_b = nullptr;
@@ -613,6 +615,7 @@ struct llama_model {
 
     bool mtp; // use mtp if is supported by the Model
     bool swa_compress = false; // value the cache-size fit was computed with
+    bool fit = false;
 
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
@@ -691,11 +694,11 @@ struct llama_model {
     }
 
     bool is_mla_model() const {
-        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_GLM5NEXT;
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_RAON1;
     }
 
     float swiglu_limit(uint32_t il, bool shared) const {
-        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && !llm_arch_is_dsv4(arch) && arch != LLM_ARCH_GLM5NEXT && !hparams.dflash_dsv4) {
+        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && !llm_arch_is_dsv4(arch) && arch != LLM_ARCH_GLM5NEXT && arch != LLM_ARCH_MAPLE && !hparams.dflash_dsv4) {
             return 0.0f;
         }
         return shared ? hparams.swiglu_limits_shared[il] : hparams.swiglu_limits[il];
@@ -725,6 +728,7 @@ struct llama_model {
     bool supports_swa_compress() const {
         return arch == LLM_ARCH_OPENPANGU || llm_arch_is_dsv4(arch)
             || arch == LLM_ARCH_LAGUNA    || arch == LLM_ARCH_GEMMA4
+            || arch == LLM_ARCH_MAPLE     || arch == LLM_ARCH_FLINT
             || supports_dflash_swa_compress() ;
     }
 
